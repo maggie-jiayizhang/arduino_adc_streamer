@@ -196,6 +196,11 @@ MAX_SWEEPS_IN_MEMORY = 50000
 # Higher values = more force data for analysis, but more memory usage
 MAX_FORCE_SAMPLES = 50000
 
+# Force sensor conversion factors (raw counts per Newton)
+# Newtons = calibrated_raw / FORCE_SENSOR_TO_NEWTON
+X_FORCE_SENSOR_TO_NEWTON = 44600.0
+Z_FORCE_SENSOR_TO_NEWTON = 44900.0
+
 # Maximum number of log lines to keep in status text window
 # Prevents excessive memory usage from log accumulation during long sessions
 MAX_LOG_LINES = 1000
@@ -258,10 +263,29 @@ HEATMAP_DC_REMOVAL_MODE = "highpass"  # "bias" or "highpass"
 # Example: ["R", "B", "C", "L", "T"] means channel1->Right, channel2->Bottom, ...
 # Configuration for PLUS sensors: HEATMAP_CHANNEL_SENSOR_MAP = ["R", "B", "C", "L", "T"]
 # Configuration for Single Octo sensors: HEATMAP_CHANNEL_SENSOR_MAP = ["R", "C", "B", "L", "T"]
+# HEATMAP_CHANNEL_SENSOR_MAP = ["B", "R", "C", "L", "T"]
 HEATMAP_CHANNEL_SENSOR_MAP = ["R", "B", "C", "L", "T"]
 
 # Expected number of channels for heatmap
 HEATMAP_REQUIRED_CHANNELS = 5
+
+# 555 analyzer 4-sensor displacement heatmap mapping (no center sensor)
+# Channel order maps to sensor labels used by the 555 heatmap pipeline.
+R_HEATMAP_CHANNEL_SENSOR_MAP = ["R", "B", "L", "T"]
+R_HEATMAP_REQUIRED_CHANNELS = 4
+
+# 555 sensor geometry (normalized coordinates in heatmap space)
+# Sensor indices 1..4 follow R_HEATMAP_CHANNEL_SENSOR_MAP order.
+R_HEATMAP_SENSOR_POS_X = [1.0, 0.0, -1.0, 0.0]
+R_HEATMAP_SENSOR_POS_Y = [0.0, -1.0, 0.0, 1.0]
+
+# 555 displacement heatmap defaults
+R_HEATMAP_DELTA_THRESHOLD = 1.0
+R_HEATMAP_DELTA_RELEASE_THRESHOLD = 1.0
+R_HEATMAP_INTENSITY_MIN = 10.0
+R_HEATMAP_INTENSITY_MAX = 200.0
+R_HEATMAP_AXIS_ADAPT_STRENGTH = 0.5
+R_HEATMAP_MAP_SMOOTH_ALPHA = 0.2
 
 # ============================================================================
 # Plot Colors
