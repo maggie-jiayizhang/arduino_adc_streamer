@@ -126,11 +126,12 @@ class DataExporterMixin:
                 if self.capture_start_time and self.capture_end_time:
                     capture_duration = self.capture_end_time - self.capture_start_time
 
-                # Approximate row timestamp in seconds from capture start
+                # Approximate row timestamp in seconds from capture start (fallback only)
                 def get_row_timestamp(saved_idx):
-                    if capture_duration is None or saved_total <= 0:
-                        return 0.0
-                    return (saved_idx / saved_total) * capture_duration
+                    if capture_duration is None or saved_total <= 1:
+                        return None
+                    # Spread timestamps across the measured capture duration
+                    return (saved_idx / (saved_total - 1)) * capture_duration
 
                 def parse_archive_sweep_entry(line_text):
                     payload = json.loads(line_text)
@@ -148,19 +149,37 @@ class DataExporterMixin:
 
                     return None, None
 
-                # Helper to find closest force sample given a normalized saved_index
-                def get_closest_force(saved_idx):
-                    if not force_dict or capture_duration is None or saved_total <= 0:
+                # Helper to find closest force sample given the sweep timestamp (seconds)
+                def get_closest_force(sweep_time_s):
+                    if not force_dict or sweep_time_s is None:
                         return (0.0, 0.0)
-                    sweep_time = get_row_timestamp(saved_idx)
                     closest_force = (0.0, 0.0)
                     min_diff = float('inf')
                     for f_time, (x, z) in force_dict.items():
-                        diff = abs(f_time - sweep_time)
+                        diff = abs(f_time - sweep_time_s)
                         if diff < min_diff:
                             min_diff = diff
                             closest_force = (x, z)
                     return closest_force
+
+                # Resolve the sweep timestamp using archive data, loaded timestamps, or fallback spacing
+                def resolve_sweep_time(saved_idx, archive_ts, global_idx):
+                    # Prefer explicit timestamp from archive (new format)
+                    if archive_ts is not None:
+                        try:
+                            return float(archive_ts)
+                        except Exception:
+                            pass
+
+                    # If we are in full view, use loaded sweep_timestamps when available
+                    if self.sweep_timestamps and global_idx < len(self.sweep_timestamps):
+                        try:
+                            return float(self.sweep_timestamps[global_idx])
+                        except Exception:
+                            pass
+
+                    # Fallback to evenly spaced approximation across capture duration
+                    return get_row_timestamp(saved_idx)
 
                 # Stream archived sweeps only if present; otherwise use in-memory sweeps
                 if has_archive_data:
@@ -184,11 +203,14 @@ class DataExporterMixin:
                                 if first_sweep_len is None:
                                     first_sweep_len = len(sweep)
 
+                                row_time = resolve_sweep_time(saved_index, row_timestamp, global_idx)
+
                                 row = list(sweep)
                                 if is_555_mode:
-                                    timestamp_to_write = row_timestamp if row_timestamp is not None else float(get_row_timestamp(saved_index))
+                                    # Preserve MCU timestamp if present; otherwise fallback spacing
+                                    timestamp_to_write = row_time if row_time is not None else 0.0
                                     row.insert(0, float(timestamp_to_write))
-                                row.extend(list(get_closest_force(saved_index)))
+                                row.extend(list(get_closest_force(row_time)))
                                 writer.writerow(row)
                                 saved_index += 1
                             global_idx += 1
@@ -201,10 +223,13 @@ class DataExporterMixin:
                             if first_sweep_len is None:
                                 first_sweep_len = len(sweep)
 
+                            row_time = resolve_sweep_time(saved_index, None, global_idx)
+
                             row = list(sweep)
                             if is_555_mode:
-                                row.insert(0, float(get_row_timestamp(saved_index)))
-                            row.extend(list(get_closest_force(saved_index)))
+                                timestamp_to_write = row_time if row_time is not None else 0.0
+                                row.insert(0, float(timestamp_to_write))
+                            row.extend(list(get_closest_force(row_time)))
                             writer.writerow(row)
                             saved_index += 1
                         global_idx += 1
