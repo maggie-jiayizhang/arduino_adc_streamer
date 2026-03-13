@@ -10,16 +10,20 @@ from PyQt6.QtCore import QRectF, Qt
 from PyQt6.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
+    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
 )
+import json
 import numpy as np
 import pyqtgraph as pg
+from pathlib import Path
 
 from config_constants import (
     HEATMAP_HEIGHT,
@@ -41,6 +45,149 @@ from config_constants import (
 
 class ShearPanelMixin:
     """Mixin providing the Shear tab UI."""
+
+    def enable_shear_settings_autosave(self):
+        self._shear_autosave_enabled = True
+
+    def _get_last_shear_settings_path(self):
+        return Path.home() / ".adc_streamer" / "shear" / "last_used_shear_settings.json"
+
+    def _serialize_shear_settings(self):
+        return {
+            "version": 1,
+            "shear_settings": self.get_shear_settings(),
+        }
+
+    def _apply_shear_settings(self, settings):
+        if not settings:
+            return False
+
+        changed = False
+        scalar_map = [
+            ("integration_window_ms", getattr(self, "shear_window_spin", None)),
+            ("conditioning_alpha", getattr(self, "shear_conditioning_alpha_spin", None)),
+            ("baseline_alpha", getattr(self, "shear_baseline_alpha_spin", None)),
+            ("deadband_threshold", getattr(self, "shear_deadband_spin", None)),
+            ("confidence_signal_ref", getattr(self, "shear_confidence_ref_spin", None)),
+            ("blob_sigma_x", getattr(self, "shear_sigma_x_spin", None)),
+            ("blob_sigma_y", getattr(self, "shear_sigma_y_spin", None)),
+            ("intensity_scale", getattr(self, "shear_intensity_scale_spin", None)),
+            ("arrow_scale", getattr(self, "shear_arrow_scale_spin", None)),
+        ]
+        for key, widget in scalar_map:
+            if key in settings and widget is not None:
+                widget.setValue(float(settings[key]))
+                changed = True
+
+        sensor_labels = ["C", "R", "B", "L", "T"]
+        gains = settings.get("sensor_gains", {})
+        baselines = settings.get("sensor_baselines", {})
+        for label, spin in zip(sensor_labels, getattr(self, "shear_gain_spins", [])):
+            if label in gains:
+                spin.setValue(float(gains[label]))
+                changed = True
+        for label, spin in zip(sensor_labels, getattr(self, "shear_baseline_spins", [])):
+            if label in baselines:
+                spin.setValue(float(baselines[label]))
+                changed = True
+
+        return changed
+
+    def save_shear_settings_to_path(self, file_path, log_message=True):
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._serialize_shear_settings()
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        if log_message:
+            self.log_status(f"Saved shear settings: {path}")
+
+    def load_shear_settings_from_path(self, file_path, log_message=True):
+        path = Path(file_path)
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        settings = payload.get("shear_settings", payload)
+        applied = self._apply_shear_settings(settings)
+
+        if log_message:
+            if applied:
+                self.log_status(f"Loaded shear settings: {path}")
+            else:
+                self.log_status(f"Shear settings file loaded, no applicable fields: {path}")
+
+        return applied
+
+    def save_last_shear_settings(self):
+        if not getattr(self, "_shear_autosave_enabled", False):
+            return
+        try:
+            self.save_shear_settings_to_path(self._get_last_shear_settings_path(), log_message=False)
+        except Exception as exc:
+            self.log_status(f"Warning: could not save last shear settings: {exc}")
+
+    def load_last_shear_settings(self):
+        path = self._get_last_shear_settings_path()
+        if not path.exists():
+            return False
+        try:
+            return self.load_shear_settings_from_path(path, log_message=True)
+        except Exception as exc:
+            self.log_status(f"Warning: could not load last shear settings: {exc}")
+            return False
+
+    def on_save_shear_settings_clicked(self):
+        default_dir = self._get_last_shear_settings_path().parent
+        default_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Shear Settings",
+            str(default_dir / "shear_settings.json"),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            self.save_shear_settings_to_path(file_path, log_message=True)
+        except Exception as exc:
+            self.log_status(f"Error saving shear settings: {exc}")
+
+    def on_load_shear_settings_clicked(self):
+        default_dir = self._get_last_shear_settings_path().parent
+        default_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Shear Settings",
+            str(default_dir),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            self.load_shear_settings_from_path(file_path, log_message=True)
+            self.save_last_shear_settings()
+        except Exception as exc:
+            self.log_status(f"Error loading shear settings: {exc}")
+
+    def _connect_shear_settings_autosave(self):
+        widgets = [
+            getattr(self, "shear_window_spin", None),
+            getattr(self, "shear_conditioning_alpha_spin", None),
+            getattr(self, "shear_baseline_alpha_spin", None),
+            getattr(self, "shear_deadband_spin", None),
+            getattr(self, "shear_confidence_ref_spin", None),
+            getattr(self, "shear_sigma_x_spin", None),
+            getattr(self, "shear_sigma_y_spin", None),
+            getattr(self, "shear_intensity_scale_spin", None),
+            getattr(self, "shear_arrow_scale_spin", None),
+        ]
+        widgets.extend(getattr(self, "shear_gain_spins", []))
+        widgets.extend(getattr(self, "shear_baseline_spins", []))
+        for widget in widgets:
+            if widget is not None:
+                widget.valueChanged.connect(self.save_last_shear_settings)
 
     def create_shear_tab(self):
         shear_widget = QWidget()
@@ -200,6 +347,17 @@ class ShearPanelMixin:
         group = QGroupBox("Shear Settings")
         main_layout = QVBoxLayout()
 
+        actions_layout = QHBoxLayout()
+        self.save_shear_settings_btn = QPushButton("Save Settings...")
+        self.save_shear_settings_btn.clicked.connect(self.on_save_shear_settings_clicked)
+        actions_layout.addWidget(self.save_shear_settings_btn)
+
+        self.load_shear_settings_btn = QPushButton("Load Settings...")
+        self.load_shear_settings_btn.clicked.connect(self.on_load_shear_settings_clicked)
+        actions_layout.addWidget(self.load_shear_settings_btn)
+        actions_layout.addStretch()
+        main_layout.addLayout(actions_layout)
+
         signal_group = QGroupBox("Signal Processing")
         signal_layout = QGridLayout()
         signal_layout.setColumnMinimumWidth(2, 80)
@@ -209,6 +367,7 @@ class ShearPanelMixin:
         self.shear_window_spin.setRange(1.0, 500.0)
         self.shear_window_spin.setDecimals(1)
         self.shear_window_spin.setValue(SHEAR_INTEGRATION_WINDOW_MS)
+        self.shear_window_spin.setToolTip("Signed integration window. Larger values smooth and stabilize the shear estimate but add lag.")
         signal_layout.addWidget(self.shear_window_spin, 0, 1)
 
         signal_layout.addWidget(QLabel("Conditioning Alpha:"), 0, 3)
@@ -217,6 +376,7 @@ class ShearPanelMixin:
         self.shear_conditioning_alpha_spin.setDecimals(3)
         self.shear_conditioning_alpha_spin.setSingleStep(0.01)
         self.shear_conditioning_alpha_spin.setValue(SHEAR_CONDITIONING_ALPHA)
+        self.shear_conditioning_alpha_spin.setToolTip("Light EMA smoothing after baseline removal. Higher values follow new samples more strongly.")
         signal_layout.addWidget(self.shear_conditioning_alpha_spin, 0, 4)
 
         signal_layout.addWidget(QLabel("Baseline Alpha:"), 1, 0)
@@ -225,6 +385,7 @@ class ShearPanelMixin:
         self.shear_baseline_alpha_spin.setDecimals(3)
         self.shear_baseline_alpha_spin.setSingleStep(0.01)
         self.shear_baseline_alpha_spin.setValue(SHEAR_BASELINE_ALPHA)
+        self.shear_baseline_alpha_spin.setToolTip("How quickly each channel's DC baseline adapts to drift. Lower values hold zero more steadily.")
         signal_layout.addWidget(self.shear_baseline_alpha_spin, 1, 1)
 
         signal_layout.addWidget(QLabel("Deadband:"), 1, 3)
@@ -232,6 +393,7 @@ class ShearPanelMixin:
         self.shear_deadband_spin.setRange(0.0, 1e6)
         self.shear_deadband_spin.setDecimals(6)
         self.shear_deadband_spin.setValue(SHEAR_DEADBAND_THRESHOLD)
+        self.shear_deadband_spin.setToolTip("Symmetric threshold around zero. Small integrated values inside this band are treated as noise.")
         signal_layout.addWidget(self.shear_deadband_spin, 1, 4)
 
         signal_layout.addWidget(QLabel("Confidence Ref:"), 2, 0)
@@ -239,6 +401,7 @@ class ShearPanelMixin:
         self.shear_confidence_ref_spin.setRange(1e-6, 1e6)
         self.shear_confidence_ref_spin.setDecimals(6)
         self.shear_confidence_ref_spin.setValue(SHEAR_CONFIDENCE_SIGNAL_REF)
+        self.shear_confidence_ref_spin.setToolTip("Reference signal level used to scale confidence. Increase it if confidence rises too easily.")
         signal_layout.addWidget(self.shear_confidence_ref_spin, 2, 1)
 
         signal_group.setLayout(signal_layout)
@@ -257,6 +420,7 @@ class ShearPanelMixin:
             spin.setDecimals(4)
             spin.setValue(value)
             spin.setPrefix(f"{label}: ")
+            spin.setToolTip(f"Gain correction for sensor {label}. Applied after deadband while preserving sign.")
             self.shear_gain_spins.append(spin)
             gain_layout.addWidget(spin)
         gain_layout.addStretch()
@@ -271,6 +435,7 @@ class ShearPanelMixin:
             spin.setDecimals(6)
             spin.setValue(value)
             spin.setPrefix(f"{label}: ")
+            spin.setToolTip(f"Per-channel post-integration noise floor for sensor {label}.")
             self.shear_baseline_spins.append(spin)
             baseline_layout.addWidget(spin)
         baseline_layout.addStretch()
@@ -288,6 +453,7 @@ class ShearPanelMixin:
         self.shear_sigma_x_spin.setRange(0.01, 2.0)
         self.shear_sigma_x_spin.setDecimals(3)
         self.shear_sigma_x_spin.setValue(SHEAR_GAUSSIAN_SIGMA_X)
+        self.shear_sigma_x_spin.setToolTip("Horizontal spread of the Gaussian CoP blob.")
         viz_layout.addWidget(self.shear_sigma_x_spin, 0, 1)
 
         viz_layout.addWidget(QLabel("Gaussian Sigma Y:"), 0, 3)
@@ -295,6 +461,7 @@ class ShearPanelMixin:
         self.shear_sigma_y_spin.setRange(0.01, 2.0)
         self.shear_sigma_y_spin.setDecimals(3)
         self.shear_sigma_y_spin.setValue(SHEAR_GAUSSIAN_SIGMA_Y)
+        self.shear_sigma_y_spin.setToolTip("Vertical spread of the Gaussian CoP blob.")
         viz_layout.addWidget(self.shear_sigma_y_spin, 0, 4)
 
         viz_layout.addWidget(QLabel("Intensity Scale:"), 1, 0)
@@ -303,6 +470,7 @@ class ShearPanelMixin:
         self.shear_intensity_scale_spin.setDecimals(6)
         self.shear_intensity_scale_spin.setSingleStep(0.01)
         self.shear_intensity_scale_spin.setValue(SHEAR_INTENSITY_SCALE)
+        self.shear_intensity_scale_spin.setToolTip("Scales residual vertical-force magnitude into blob brightness.")
         viz_layout.addWidget(self.shear_intensity_scale_spin, 1, 1)
 
         viz_layout.addWidget(QLabel("Arrow Scale:"), 1, 3)
@@ -310,11 +478,13 @@ class ShearPanelMixin:
         self.shear_arrow_scale_spin.setRange(0.0, 5.0)
         self.shear_arrow_scale_spin.setDecimals(3)
         self.shear_arrow_scale_spin.setValue(SHEAR_ARROW_SCALE)
+        self.shear_arrow_scale_spin.setToolTip("Visual scaling for the centered shear arrow length. Does not change the computed shear.")
         viz_layout.addWidget(self.shear_arrow_scale_spin, 1, 4)
 
         viz_group.setLayout(viz_layout)
         main_layout.addWidget(viz_group)
 
+        self._connect_shear_settings_autosave()
         group.setLayout(main_layout)
         return group
 

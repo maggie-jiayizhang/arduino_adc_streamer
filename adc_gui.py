@@ -94,6 +94,8 @@ class ADCStreamerGUI(
         self.init_ui()
         self.load_last_heatmap_settings()
         self.enable_heatmap_settings_autosave()
+        self.load_last_shear_settings()
+        self.enable_shear_settings_autosave()
         self.load_last_spectrum_settings()
 
         # Post-initialization
@@ -366,6 +368,7 @@ class ADCStreamerGUI(
     def closeEvent(self, event):
         """Handle window close event."""
         self.save_last_heatmap_settings()
+        self.save_last_shear_settings()
         self.save_last_spectrum_settings()
 
         if self.serial_port and self.serial_port.is_open:
