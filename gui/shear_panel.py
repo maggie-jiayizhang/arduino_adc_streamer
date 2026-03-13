@@ -6,6 +6,7 @@ Real-time shear / CoP visualization for the 5-channel MG-24 piezo package.
 
 from __future__ import annotations
 
+import math
 from PyQt6.QtCore import QRectF, Qt
 from PyQt6.QtWidgets import (
     QApplication,
@@ -324,6 +325,15 @@ class ShearPanelMixin:
         # Keep a stable logical coordinate space when the main window is resized/maximized.
         self._configure_shear_plot_view()
 
+    def _arrow_item_angle_from_vector(self, dx: float, dy: float) -> float:
+        """
+        Map a plot-space vector to pyqtgraph ArrowItem's angle convention.
+
+        ArrowItem angle=0 points left (-X), so derive the angle from the actual
+        rendered endpoint vector instead of the custom shear-angle convention.
+        """
+        return math.degrees(math.atan2(float(dy), float(dx))) - 180.0
+
     def _build_shear_lookup_table(self):
         """Use a transparent low end so only the blob changes color, not the background."""
         base = pg.colormap.get("viridis").getLookupTable(alpha=True)
@@ -597,7 +607,7 @@ class ShearPanelMixin:
         if has_arrow:
             self.shear_arrow_line.setData([0.0, arrow_end_x], [0.0, arrow_end_y])
             self.shear_arrow_head.setPos(arrow_end_x, arrow_end_y)
-            self.shear_arrow_head.setStyle(angle=-result.shear_angle_deg + 90.0)
+            self.shear_arrow_head.setStyle(angle=self._arrow_item_angle_from_vector(arrow_end_x, arrow_end_y))
             self.shear_arrow_line.setVisible(True)
             self.shear_arrow_head.setVisible(True)
         else:
