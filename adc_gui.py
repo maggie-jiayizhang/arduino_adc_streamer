@@ -26,7 +26,7 @@ import threading
 from typing import List, Optional, Dict
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QCheckBox
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QThread, QTimer, Qt
 import serial
 
 # Import configuration constants
@@ -34,6 +34,7 @@ from config_constants import *
 
 # Import refactored modules
 from serial_communication import ADCSerialMixin, ForceSerialMixin
+from serial_communication.serial_threads import SerialReaderThread
 from config import MCUDetectorMixin, ConfigurationMixin
 from gui import GUIComponentsMixin
 from data_processing import (
