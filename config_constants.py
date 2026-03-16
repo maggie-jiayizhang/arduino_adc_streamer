@@ -269,8 +269,10 @@ HEATMAP_DC_REMOVAL_MODE = "highpass"  # "bias" or "highpass"
 # Example: ["R", "B", "C", "L", "T"] means channel1->Right, channel2->Bottom, ...
 HEATMAP_CHANNEL_SENSOR_MAP_PLUS = ["R", "B", "C", "L", "T"] # Configuration for PLUS sensors
 HEATMAP_CHANNEL_SENSOR_MAP_OCTO = ["R", "C", "B", "L", "T"] # Configuration for Single Octo sensors
-HEATMAP_CHANNEL_SENSOR_MAP_ARRAY1 =  ["C", "R", "B", "L", "T"] # Configuration for array Octo sensors / reveresed
-HEATMAP_CHANNEL_SENSOR_MAP = HEATMAP_CHANNEL_SENSOR_MAP_ARRAY1
+HEATMAP_CHANNEL_SENSOR_MAP_ARRAY_v1_R =  ["C", "R", "B", "L", "T"] # Configuration for array Octo sensors / reveresed
+HEATMAP_CHANNEL_SENSOR_MAP_ARRAY_v1 =  ["T", "L", "B", "R", "C"] # Configuration for array Octo sensors
+
+HEATMAP_CHANNEL_SENSOR_MAP = HEATMAP_CHANNEL_SENSOR_MAP_ARRAY_v1  # Set the active mapping here based on your sensor configuration
 
 # Expected number of channels for heatmap
 HEATMAP_REQUIRED_CHANNELS = 5
@@ -314,6 +316,9 @@ SHEAR_GAUSSIAN_SIGMA_X = 0.18
 SHEAR_GAUSSIAN_SIGMA_Y = 0.18
 SHEAR_INTENSITY_SCALE = 0.2
 SHEAR_ARROW_SCALE = 0.35
+SHEAR_ARROW_HEAD_LENGTH_BASE_PX = 12.0
+SHEAR_ARROW_HEAD_LENGTH_AMPLIFIER = 12.0
+SHEAR_ARROW_THICKNESS_AMPLIFIER = 30.0
 
 # Confidence scoring reference magnitude
 SHEAR_CONFIDENCE_SIGNAL_REF = 0.02

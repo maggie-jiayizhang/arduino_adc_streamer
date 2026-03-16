@@ -30,7 +30,10 @@ from config_constants import (
     HEATMAP_HEIGHT,
     HEATMAP_WIDTH,
     HEATMAP_CHANNEL_SENSOR_MAP,
+    SHEAR_ARROW_HEAD_LENGTH_AMPLIFIER,
+    SHEAR_ARROW_HEAD_LENGTH_BASE_PX,
     SHEAR_ARROW_SCALE,
+    SHEAR_ARROW_THICKNESS_AMPLIFIER,
     SHEAR_BASELINE_ALPHA,
     SHEAR_CHANNEL_BASELINES,
     SHEAR_CHANNEL_GAINS,
@@ -271,7 +274,14 @@ class ShearPanelMixin:
         self.shear_arrow_line.setZValue(10)
         self.shear_plot.addItem(self.shear_arrow_line)
 
-        self.shear_arrow_head = pg.ArrowItem(angle=0.0, headLen=18, tipAngle=28, baseAngle=20, brush=(235, 80, 60), pen=pg.mkPen((235, 80, 60)))
+        self.shear_arrow_head = pg.ArrowItem(
+            angle=0.0,
+            headLen=SHEAR_ARROW_HEAD_LENGTH_BASE_PX,
+            tipAngle=28,
+            baseAngle=20,
+            brush=(235, 80, 60),
+            pen=pg.mkPen((235, 80, 60)),
+        )
         self.shear_arrow_head.setZValue(11)
         self.shear_plot.addItem(self.shear_arrow_head)
 
@@ -329,10 +339,32 @@ class ShearPanelMixin:
         """
         Map a plot-space vector to pyqtgraph ArrowItem's angle convention.
 
-        ArrowItem angle=0 points left (-X), so derive the angle from the actual
-        rendered endpoint vector instead of the custom shear-angle convention.
+        ArrowItem angle=0 points left (-X), but its rotation is applied in item
+        coordinates where Y increases downward. In the plot, positive Y is up,
+        so the plot-space Y component must be inverted before converting.
         """
-        return math.degrees(math.atan2(float(dy), float(dx))) - 180.0
+        return math.degrees(math.atan2(float(-dy), float(dx))) - 180.0
+
+    def _arrow_head_tip_position(self, line_end_x: float, line_end_y: float, head_length_px: float) -> tuple[float, float]:
+        arrow_length = math.hypot(line_end_x, line_end_y)
+        if arrow_length <= 1e-12:
+            return line_end_x, line_end_y
+
+        view_box = self.shear_plot.getViewBox()
+        x_range, y_range = view_box.viewRange()
+        rect = view_box.sceneBoundingRect()
+        width = max(float(rect.width()), 1.0)
+        height = max(float(rect.height()), 1.0)
+
+        x_units_per_pixel = (x_range[1] - x_range[0]) / width
+        y_units_per_pixel = (y_range[1] - y_range[0]) / height
+        unit_x = line_end_x / arrow_length
+        unit_y = line_end_y / arrow_length
+
+        return (
+            line_end_x + (unit_x * x_units_per_pixel * head_length_px),
+            line_end_y + (unit_y * y_units_per_pixel * head_length_px),
+        )
 
     def _build_shear_lookup_table(self):
         """Use a transparent low end so only the blob changes color, not the background."""
@@ -602,12 +634,21 @@ class ShearPanelMixin:
         arrow_scale = self.shear_arrow_scale_spin.value()
         arrow_end_x = result.shear_x * arrow_scale
         arrow_end_y = result.shear_y * arrow_scale
+        arrow_length = math.hypot(arrow_end_x, arrow_end_y)
+        relative_arrow_length = min(arrow_length / self.SHEAR_VIEW_EXTENT, 1.0)
         has_arrow = result.shear_magnitude > 1e-6 and (abs(arrow_end_x) > 1e-6 or abs(arrow_end_y) > 1e-6)
 
         if has_arrow:
+            arrow_line_width = 3.0 + (relative_arrow_length * SHEAR_ARROW_THICKNESS_AMPLIFIER)
+            arrow_head_length_px = SHEAR_ARROW_HEAD_LENGTH_BASE_PX + (relative_arrow_length * SHEAR_ARROW_HEAD_LENGTH_AMPLIFIER)
+            self.shear_arrow_line.setPen(pg.mkPen((235, 80, 60), width=arrow_line_width))
             self.shear_arrow_line.setData([0.0, arrow_end_x], [0.0, arrow_end_y])
-            self.shear_arrow_head.setPos(arrow_end_x, arrow_end_y)
-            self.shear_arrow_head.setStyle(angle=self._arrow_item_angle_from_vector(arrow_end_x, arrow_end_y))
+            arrow_tip_x, arrow_tip_y = self._arrow_head_tip_position(arrow_end_x, arrow_end_y, arrow_head_length_px)
+            self.shear_arrow_head.setPos(arrow_tip_x, arrow_tip_y)
+            self.shear_arrow_head.setStyle(
+                angle=self._arrow_item_angle_from_vector(arrow_end_x, arrow_end_y),
+                headLen=arrow_head_length_px,
+            )
             self.shear_arrow_line.setVisible(True)
             self.shear_arrow_head.setVisible(True)
         else:
