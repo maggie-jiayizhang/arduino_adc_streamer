@@ -1,60 +1,75 @@
 /*
- * High-speed ADC Binary Sweeper with Blocked Output — Teensy 4.1
- * --------------------------------------------------------------
+ * ADC_Streamer_binary_scan2.ino
+ * ------------------------------------------------
+ * Teensy 4.x sketch that keeps the MG24 serial API and binary block format.
  *
- * New Teensy-specific features:
+ * Goals:
+ *   - Same command names as the MG24 sketch:
+ *       channels, ground, repeat, buffer, ref, osr, gain,
+ *       run, stop, status, mcu, help
+ *   - Same binary block framing as the MG24 sketch:
+ *       [0xAA][0x55][countL][countH]
+ *       + count * uint16 samples (LE)
+ *       + avg_dt_us (uint16 LE)
+ *       + block_start_us (uint32 LE)
+ *       + block_end_us   (uint32 LE)
+ *   - The host can distinguish devices using printMcu().
  *
- *   - ref 3.3* / ref vdd*   -> ADC reference = 3.3V (actual hardware setting)
- *   - ref 1.2*              -> ERROR on Teensy 4.1 (1.2V internal ref not supported)
+ * Important Teensy 4.0 notes:
+ *   - The ADC hardware uses 3.3V reference only in this implementation.
+ *     Therefore "ref 1.2" returns an error.
+ *   - "osr 2|4|8" is mapped to ADC hardware averaging 2/4/8.
+ *   - "gain 1|2|3|4" is kept for API compatibility and status reporting,
+ *     but Teensy 4.0 ADC has no equivalent analog gain setting here.
  *
- *   - conv low|med|high|ad10|ad20*
- *        low   -> ADC_CONVERSION_SPEED::LOW_SPEED
- *        med   -> ADC_CONVERSION_SPEED::MED_SPEED
- *        high  -> ADC_CONVERSION_SPEED::HIGH_SPEED
- *        ad10  -> ADC_CONVERSION_SPEED::ADACK_10  (10 MHz async clock)
- *        ad20  -> ADC_CONVERSION_SPEED::ADACK_20  (20 MHz async clock)
- *
- *   - samp vlow|low|lmed|med|mhigh|high|hvhigh|vhigh*
- *        mapped to ADC_SAMPLING_SPEED enum (Teensy 4.1)
- *
- *   - rate 0*         -> free-run as fast as possible (current behavior)
- *   - rate 50000*     -> target ~50 kSamples/s, using IntervalTimer
- *
- * Timer-based sampling:
- *   - An IntervalTimer ISR increments a tick counter at the requested rate.
- *   - doOneBlock() waits for one tick per ADC sample, so every sample is paced
- *     by the hardware timer (sampling rate).
- *
- * Protocol, commands, and binary block format remain compatible with the MG24 version.
+ * Commands (terminated by '*'):
+ *   channels 14,15,16,17,18*
+ *   ground 19*
+ *   ground true*
+ *   ground false*
+ *   repeat 20*
+ *   buffer 10*
+ *   ref 3.3*
+ *   ref vdd*
+ *   osr 2*
+ *   osr 4*
+ *   osr 8*
+ *   gain 1*
+ *   gain 2*
+ *   gain 3*
+ *   gain 4*
+ *   run*
+ *   run 100*
+ *   stop*
+ *   status*
+ *   mcu*
+ *   help*
  */
 
 #include <Arduino.h>
 #include <ADC.h>
 #include <ADC_util.h>
-#include <IntervalTimer.h>
 
 // ---------------------------------------------------------------------
 // Limits & defaults
 // ---------------------------------------------------------------------
 
-const uint8_t  MAX_SEQUENCE_LEN   = 16;     // Max number of channels in sequence
-const uint32_t BAUD_RATE          = 460800; // Ignored for USB, but kept for symmetry
-
-// Max samples in RAM buffer (each sample = uint16_t)
-const uint32_t MAX_SAMPLES_BUFFER = 32000;  // 32000 * 2bytes = 64kB
-
-// Logical "scan entries" count (no HW table limit on Teensy; informational only)
-const uint16_t MAX_SCAN_ENTRIES   = 65535;
+const uint8_t  MAX_SEQUENCE_LEN   = 16;
+const uint32_t BAUD_RATE          = 460800;
+const uint32_t MAX_SAMPLES_BUFFER = 32000;   // 64 kB (uint16_t samples)
+const uint16_t MAX_SCAN_ENTRIES   = 65535;   // informational on Teensy
+const uint16_t MAX_REPEAT_COUNT   = 100;
+const uint16_t ADC_WARMUP_SWEEPS  = 48;
 
 // ---------------------------------------------------------------------
 // Command framing constants
 // ---------------------------------------------------------------------
 
-static const char     CMD_TERMINATOR   = '*';   // '*' ends a command
-static const uint16_t MAX_CMD_LENGTH   = 512;   // Max input line length
+static const char     CMD_TERMINATOR = '*';
+static const uint16_t MAX_CMD_LENGTH = 512;
 
 // ---------------------------------------------------------------------
-// Simplified analog reference type (for status only)
+// Reference enum kept compatible with MG24 sketch status output
 // ---------------------------------------------------------------------
 
 enum analog_references {
@@ -68,98 +83,54 @@ enum analog_references {
 // Teensy ADC instance
 // ---------------------------------------------------------------------
 
-ADC adc;  // main ADC controller (we use adc0)
+ADC adc;
 
 // ---------------------------------------------------------------------
 // Configuration state
 // ---------------------------------------------------------------------
 
-uint8_t  channelSequence[MAX_SEQUENCE_LEN]; // user-chosen pins in sweep
-uint8_t  channelCount        = 0;           // how many channels in sequence
+uint8_t  channelSequence[MAX_SEQUENCE_LEN];
+uint8_t  channelCount        = 0;
 
-// Ground configuration:
-// - Default ground pin is 0.
-// - Default: ground dummy reads disabled.
-int   groundPin              = 0;
-bool  useGroundBeforeEach    = false;
+int      groundPin           = 0;
+bool     useGroundBeforeEach = false;
 
-// repeatCount = number of readings per channel per sweep (sent to PC)
 uint16_t repeatCount         = 1;
-
-// ADC sample buffer for multiple sweeps (flattened, only NON-ground samples)
 uint16_t adcBuffer[MAX_SAMPLES_BUFFER];
 
-// Derived config values
-uint16_t samplesPerSweep       = 0;  // number of samples actually SENT per sweep (no ground)
-uint16_t scanEntriesPerSweep   = 0;  // logical count: channels + ground entries
+uint16_t samplesPerSweep     = 0;   // sent to host (no ground samples)
+uint16_t scanEntriesPerSweep = 0;   // logical entries including ground
+uint16_t sweepsPerBlock      = 1;
 
-// Blocked/buffered sweeps:
-uint16_t sweepsPerBlock        = 1;  // how many sweeps per block
-uint16_t sweepsInCurrentBlock  = 0;  // informational only
+analog_references currentRef = AR_VDD;
+static uint8_t     g_osr_cmd = 2;
+static uint8_t     g_gain_cmd = 1;
+static uint8_t     g_adc_averages = 2;
 
-// ---------------------------------------------------------------------
-// High-speed ADC configuration state (runtime adjustable)
-// ---------------------------------------------------------------------
+static ADC_CONVERSION_SPEED g_conv_speed = ADC_CONVERSION_SPEED::HIGH_SPEED;
+static ADC_SAMPLING_SPEED   g_samp_speed = ADC_SAMPLING_SPEED::VERY_HIGH_SPEED;
 
-analog_references     currentRef    = AR_VDD; // status only
-
-// OSR command value (2,4,8) mapped to hardware averaging
-static uint8_t        g_osr_cmd      = 2;
-static uint16_t       g_adc_averages = 4;  // actual averaging count used
-
-// Conversion and sampling speeds (actual ADC settings)
-static ADC_CONVERSION_SPEED g_conv_speed  = ADC_CONVERSION_SPEED::HIGH_SPEED;
-static ADC_SAMPLING_SPEED   g_samp_speed  = ADC_SAMPLING_SPEED::VERY_HIGH_SPEED;
-
-// Gain tracking (for status only)
-static uint8_t        g_gain_cmd     = 1;
-
-// ---------------------------------------------------------------------
-// Sampling rate control (hardware timer pacing)
-// ---------------------------------------------------------------------
-
-IntervalTimer          g_sampleTimer;
-volatile uint32_t      g_sampleTick      = 0;   // incremented by timer ISR
-float                  g_sampleRateHz    = 0.0; // 0 = free-run
-
-void sampleTimerISR() {
-  g_sampleTick++;
-}
-
-void stopSampleTimer() {
-  g_sampleTimer.end();
-}
-
-void startSampleTimerIfNeeded() {
-  if (g_sampleRateHz <= 0.0f) {
-    stopSampleTimer();
-    return;
-  }
-  float periodUs = 1000000.0f / g_sampleRateHz;
-  if (periodUs < 1.0f) periodUs = 1.0f; // clamp to >=1 µs
-  g_sampleTick = 0;
-  g_sampleTimer.begin(sampleTimerISR, periodUs);
-}
+static bool g_configDirty = true;
 
 // ---------------------------------------------------------------------
 // Run state
 // ---------------------------------------------------------------------
 
-bool     isRunning           = false;
-bool     timedRun            = false;
-uint32_t runStopMillis       = 0;
+bool     isRunning     = false;
+bool     timedRun      = false;
+uint32_t runStopMillis = 0;
 
 // ---------------------------------------------------------------------
 // Serial input buffer
 // ---------------------------------------------------------------------
 
-String   inputLine;
+String inputLine;
 
 // ---------------------------------------------------------------------
 // Timing measurement: block timing
 // ---------------------------------------------------------------------
 
-uint32_t blockStartMicros = 0;  // micros() when first sample of block is taken
+uint32_t blockStartMicros = 0;
 
 // ---------------------------------------------------------------------
 // Helpers
@@ -175,26 +146,34 @@ String toLowerTrim(const String &s) {
 void splitCommand(const String &line, String &cmd, String &args) {
   int idx = line.indexOf(' ');
   if (idx < 0) {
-    cmd  = line;
+    cmd = line;
     args = "";
   } else {
-    cmd  = line.substring(0, idx);
+    cmd = line.substring(0, idx);
     args = line.substring(idx + 1);
   }
   cmd.trim();
   args.trim();
 }
 
-// Dummy-read placeholder (does nothing significant on Teensy)
 void doDummyRead() {
   delayMicroseconds(10);
+}
+
+bool isValidAnalogPin(int pin) {
+  if (pin < 0 || pin > 255) return false;
+#if defined(ARDUINO_TEENSY40) || defined(CORE_TEENSY)
+  return (digitalPinToAnalogInput(pin) >= 0);
+#else
+  return true;
+#endif
 }
 
 // ---------------------------------------------------------------------
 // Command acknowledgment helper
 // ---------------------------------------------------------------------
-void sendCommandAck(bool ok, const String &args) {
 
+void sendCommandAck(bool ok, const String &args) {
   if (ok) {
     if (args.length() > 0) {
       Serial.print(F("#OK "));
@@ -216,25 +195,23 @@ void sendCommandAck(bool ok, const String &args) {
 }
 
 // ---------------------------------------------------------------------
-// Helper: calculate how many logical "scan entries" per sweep
-// (including ground entries, if enabled) — purely logical on Teensy.
+// Helper: calculate logical scan entries per sweep
 // ---------------------------------------------------------------------
+
 uint16_t calcScanEntryCount(uint16_t rep) {
   if (channelCount == 0) return 0;
 
-  uint16_t total      = 0;
-  int      prevChan   = -1;
-  bool     haveGround = useGroundBeforeEach;
+  uint16_t total = 0;
+  int prevChan = -1;
 
   for (uint8_t i = 0; i < channelCount; ++i) {
-    uint8_t chan  = channelSequence[i];
-    bool    isNew = (i == 0) || (chan != prevChan);
+    uint8_t chan = channelSequence[i];
+    bool isNew = (i == 0) || (chan != prevChan);
 
-    if (haveGround && isNew) {
-      total += 1; // ground entry
+    if (useGroundBeforeEach && isNew) {
+      total += 1;
     }
 
-    // rep samples for this channel
     total += rep;
     prevChan = chan;
   }
@@ -245,44 +222,36 @@ uint16_t calcScanEntryCount(uint16_t rep) {
 // ---------------------------------------------------------------------
 // Derived configuration recomputation
 // ---------------------------------------------------------------------
-void recomputeDerivedConfig() {
+
+bool recomputeDerivedConfig() {
   if (channelCount == 0) {
-    samplesPerSweep      = 0;
-    scanEntriesPerSweep  = 0;
-    sweepsPerBlock       = 1;
-    sweepsInCurrentBlock = 0;
-    return;
+    samplesPerSweep = 0;
+    scanEntriesPerSweep = 0;
+    sweepsPerBlock = 1;
+    g_configDirty = true;
+    return true;
   }
 
-  // Number of logical "scan entries" (channels + optional ground)
   scanEntriesPerSweep = calcScanEntryCount(repeatCount);
-
-  // Number of samples actually SENT per sweep (channels only)
   samplesPerSweep = (uint16_t)channelCount * (uint16_t)repeatCount;
 
   if (samplesPerSweep == 0) {
-    sweepsPerBlock       = 1;
-    sweepsInCurrentBlock = 0;
+    sweepsPerBlock = 1;
   } else {
-    // Ensure sweepsPerBlock fits into adcBuffer (we store only non-ground samples)
     uint32_t maxSweepsByBuffer = MAX_SAMPLES_BUFFER / (uint32_t)samplesPerSweep;
-    if (maxSweepsByBuffer == 0) {
-      maxSweepsByBuffer = 1;
-    }
-
-    if (sweepsPerBlock == 0) {
-      sweepsPerBlock = 1;
-    }
+    if (maxSweepsByBuffer == 0) maxSweepsByBuffer = 1;
+    if (sweepsPerBlock == 0) sweepsPerBlock = 1;
     if (sweepsPerBlock > maxSweepsByBuffer) {
       sweepsPerBlock = (uint16_t)maxSweepsByBuffer;
     }
-
-    sweepsInCurrentBlock = 0;
   }
+
+  g_configDirty = true;
+  return true;
 }
 
 // ---------------------------------------------------------------------
-// Binary sweep/block output helpers
+// Binary block output helpers
 // ---------------------------------------------------------------------
 
 const uint8_t SWEEP_MAGIC1 = 0xAA;
@@ -297,7 +266,7 @@ void sendSweepHeader(uint16_t totalSamples) {
   Serial.write(header, 4);
 }
 
-void sendBlock(uint16_t sampleCount, uint32_t totalTimeUs) {
+void sendBlock(uint16_t sampleCount, uint32_t blockStartUs, uint32_t blockEndUs) {
   if (sampleCount == 0) return;
 
   uint32_t totalSamples = sampleCount;
@@ -305,23 +274,31 @@ void sendBlock(uint16_t sampleCount, uint32_t totalTimeUs) {
     totalSamples = MAX_SAMPLES_BUFFER;
   }
 
+  uint32_t totalTimeUs = blockEndUs - blockStartUs;   // wrap-safe unsigned math
   uint32_t avgSampleDtUs = (totalSamples > 0) ? (totalTimeUs / totalSamples) : 0;
 
   uint16_t avgSampleDtUs16 = (avgSampleDtUs <= 65535u)
                                ? (uint16_t)avgSampleDtUs
                                : (uint16_t)65535u;
 
-  // Header
   sendSweepHeader((uint16_t)totalSamples);
-
-  // Samples (channels only, already filtered)
   Serial.write((uint8_t*)adcBuffer, (size_t)(totalSamples * sizeof(uint16_t)));
 
-  // Average per-sample time (µs)
   uint8_t rateBytes[2];
   rateBytes[0] = (uint8_t)(avgSampleDtUs16 & 0xFF);
   rateBytes[1] = (uint8_t)(avgSampleDtUs16 >> 8);
   Serial.write(rateBytes, 2);
+
+  uint8_t tsBytes[8];
+  tsBytes[0] = (uint8_t)(blockStartUs & 0xFF);
+  tsBytes[1] = (uint8_t)((blockStartUs >> 8) & 0xFF);
+  tsBytes[2] = (uint8_t)((blockStartUs >> 16) & 0xFF);
+  tsBytes[3] = (uint8_t)((blockStartUs >> 24) & 0xFF);
+  tsBytes[4] = (uint8_t)(blockEndUs & 0xFF);
+  tsBytes[5] = (uint8_t)((blockEndUs >> 8) & 0xFF);
+  tsBytes[6] = (uint8_t)((blockEndUs >> 16) & 0xFF);
+  tsBytes[7] = (uint8_t)((blockEndUs >> 24) & 0xFF);
+  Serial.write(tsBytes, 8);
 }
 
 // ---------------------------------------------------------------------
@@ -329,116 +306,89 @@ void sendBlock(uint16_t sampleCount, uint32_t totalTimeUs) {
 // ---------------------------------------------------------------------
 
 void applyADCConfig() {
-  // Use ADC0 only; resolution 12-bit
   adc.adc0->setResolution(12);
-
-  // Averaging
   adc.adc0->setAveraging(g_adc_averages);
-
-  // Conversion + sampling speed (user-configurable)
   adc.adc0->setConversionSpeed(g_conv_speed);
   adc.adc0->setSamplingSpeed(g_samp_speed);
-
-  // Reference: Teensy 4.1 ADC uses 3.3V reference only
   adc.adc0->setReference(ADC_REFERENCE::REF_3V3);
+  g_configDirty = false;
 }
 
-// Simple helper to read one sample from a given Arduino pin using ADC0
 uint16_t readSingleSample(uint8_t pin) {
   return (uint16_t)adc.adc0->analogRead(pin);
 }
 
 // ---------------------------------------------------------------------
-// Capture one block into adcBuffer using fast or timer-paced ADC reads
+// Warm-up sweeps before real capture
+// ---------------------------------------------------------------------
+
+void discardWarmupSweeps(uint16_t warmupSweeps) {
+  if (channelCount == 0 || samplesPerSweep == 0) return;
+
+  if (g_configDirty) {
+    applyADCConfig();
+  }
+
+  for (uint16_t s = 0; s < warmupSweeps; ++s) {
+    int prevChan = -1;
+
+    for (uint8_t i = 0; i < channelCount; ++i) {
+      uint8_t chan = channelSequence[i];
+      bool isNew = (i == 0) || (chan != prevChan);
+
+      if (useGroundBeforeEach && isNew) {
+        (void)readSingleSample((uint8_t)groundPin);
+      }
+
+      for (uint16_t r = 0; r < repeatCount; ++r) {
+        (void)readSingleSample(chan);
+      }
+
+      prevChan = chan;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// Capture one block into adcBuffer
 // ---------------------------------------------------------------------
 
 void doOneBlock() {
   if (!isRunning || channelCount == 0 || samplesPerSweep == 0) return;
 
-  // Total SAMPLES WE WILL SEND (no ground).
+  if (g_configDirty) {
+    applyADCConfig();
+  }
+
   uint32_t totalSamples = (uint32_t)sweepsPerBlock * (uint32_t)samplesPerSweep;
   if (totalSamples > MAX_SAMPLES_BUFFER) {
     totalSamples = MAX_SAMPLES_BUFFER;
   }
 
-  sweepsInCurrentBlock = sweepsPerBlock;
-
+  blockStartMicros = micros();
   uint32_t idx = 0;
 
-  // --- Two modes: free-run vs timer-paced sampling ---
-  bool useTimerPacing = (g_sampleRateHz > 0.0f);
+  for (uint16_t s = 0; s < sweepsPerBlock && idx < totalSamples; ++s) {
+    int prevChan = -1;
 
-  if (!useTimerPacing) {
-    // -------------------- FREE-RUN MODE --------------------
-    blockStartMicros = micros();
+    for (uint8_t i = 0; i < channelCount && idx < totalSamples; ++i) {
+      uint8_t chan = channelSequence[i];
+      bool isNew = (i == 0) || (chan != prevChan);
 
-    for (uint16_t s = 0; s < sweepsPerBlock && idx < totalSamples; ++s) {
-      int prevChan = -1;
-
-      for (uint8_t i = 0; i < channelCount && idx < totalSamples; ++i) {
-        uint8_t chan  = channelSequence[i];
-        bool    isNew = (i == 0) || (chan != prevChan);
-
-        // Optional ground dummy before each *new* channel
-        if (useGroundBeforeEach && isNew) {
-          (void)readSingleSample((uint8_t)groundPin); // discard
-        }
-
-        // Repeat samples for this channel
-        for (uint16_t r = 0; r < repeatCount && idx < totalSamples; ++r) {
-          uint16_t data = readSingleSample(chan);
-          adcBuffer[idx++] = data;
-        }
-
-        prevChan = chan;
+      if (useGroundBeforeEach && isNew) {
+        (void)readSingleSample((uint8_t)groundPin);
       }
-    }
 
-    uint32_t totalTimeUs = micros() - blockStartMicros; // ADC capture time only
-    sendBlock((uint16_t)idx, totalTimeUs);
-  } else {
-    // ---------------- TIMER-PACED MODE (one tick per sample) ----------------
-    uint32_t startTick    = g_sampleTick;
-    uint32_t expectedTick = startTick;
-
-    blockStartMicros = micros();
-
-    for (uint16_t s = 0; s < sweepsPerBlock && idx < totalSamples; ++s) {
-      int prevChan = -1;
-
-      for (uint8_t i = 0; i < channelCount && idx < totalSamples; ++i) {
-        uint8_t chan  = channelSequence[i];
-        bool    isNew = (i == 0) || (chan != prevChan);
-
-        // Optional ground dummy before each *new* channel
-        if (useGroundBeforeEach && isNew) {
-          // One timer tick for the ground sample
-          expectedTick++;
-          while (g_sampleTick < expectedTick) {
-            // spin until timer tick arrives
-          }
-          (void)readSingleSample((uint8_t)groundPin); // discard
-        }
-
-        // Repeat samples for this channel
-        for (uint16_t r = 0; r < repeatCount && idx < totalSamples; ++r) {
-          expectedTick++;
-          while (g_sampleTick < expectedTick) {
-            // wait for next timer tick
-          }
-          uint16_t data = readSingleSample(chan);
-          adcBuffer[idx++] = data;
-        }
-
-        prevChan = chan;
+      for (uint16_t r = 0; r < repeatCount && idx < totalSamples; ++r) {
+        adcBuffer[idx++] = readSingleSample(chan);
       }
-    }
 
-    uint32_t totalTimeUs = micros() - blockStartMicros;
-    sendBlock((uint16_t)idx, totalTimeUs);
+      prevChan = chan;
+    }
   }
 
-  sweepsInCurrentBlock = 0;
+  uint32_t blockEndMicros = micros();
+  sendBlock((uint16_t)idx, blockStartMicros, blockEndMicros);
 }
 
 // ---------------------------------------------------------------------
@@ -448,7 +398,7 @@ void doOneBlock() {
 bool handleChannels(const String &args) {
   channelCount = 0;
   int len = args.length();
-  int i   = 0;
+  int i = 0;
 
   while (i < len && channelCount < MAX_SEQUENCE_LEN) {
     while (i < len && (args[i] == ' ' || args[i] == ',' || args[i] == '\t')) {
@@ -460,6 +410,7 @@ bool handleChannels(const String &args) {
     while (i < len && args[i] != ' ' && args[i] != ',' && args[i] != '\t') {
       i++;
     }
+
     String token = args.substring(start, i);
     token.trim();
     if (token.length() == 0) continue;
@@ -467,6 +418,11 @@ bool handleChannels(const String &args) {
     int val = token.toInt();
     if (val < 0 || val > 255) {
       Serial.println(F("# ERROR: channel out of range (0-255)"));
+      continue;
+    }
+    if (!isValidAnalogPin(val)) {
+      Serial.print(F("# ERROR: channel pin is not a valid Teensy analog pin: "));
+      Serial.println(val);
       continue;
     }
 
@@ -479,13 +435,11 @@ bool handleChannels(const String &args) {
     return false;
   }
 
-  // Set pins as inputs
   for (uint8_t k = 0; k < channelCount; ++k) {
     pinMode(channelSequence[k], INPUT);
   }
 
-  recomputeDerivedConfig();
-  return true;
+  return recomputeDerivedConfig();
 }
 
 bool handleGround(const String &args) {
@@ -497,13 +451,21 @@ bool handleGround(const String &args) {
   String a = toLowerTrim(args);
 
   if (a == "true") {
+    if (!isValidAnalogPin(groundPin)) {
+      Serial.println(F("# ERROR: current ground pin is not a valid Teensy analog pin."));
+      return false;
+    }
     useGroundBeforeEach = true;
   } else if (a == "false") {
     useGroundBeforeEach = false;
-  } else { // command specified a pin number for groundPin
+  } else {
     int pin = a.toInt();
     if (pin < 0 || pin > 255) {
       Serial.println(F("# ERROR: ground pin out of range (0-255)"));
+      return false;
+    }
+    if (!isValidAnalogPin(pin)) {
+      Serial.println(F("# ERROR: ground pin is not a valid Teensy analog pin."));
       return false;
     }
 
@@ -512,8 +474,7 @@ bool handleGround(const String &args) {
     useGroundBeforeEach = true;
   }
 
-  recomputeDerivedConfig();
-  return true;
+  return recomputeDerivedConfig();
 }
 
 bool handleRepeat(const String &args) {
@@ -521,12 +482,13 @@ bool handleRepeat(const String &args) {
     Serial.println(F("# ERROR: repeat requires a positive integer"));
     return false;
   }
+
   long val = args.toInt();
   if (val <= 0) val = 1;
+  if (val > MAX_REPEAT_COUNT) val = MAX_REPEAT_COUNT;
 
   repeatCount = (uint16_t)val;
-  recomputeDerivedConfig();
-  return true;
+  return recomputeDerivedConfig();
 }
 
 bool handleBuffer(const String &args) {
@@ -539,12 +501,9 @@ bool handleBuffer(const String &args) {
   if (val <= 0) val = 1;
 
   sweepsPerBlock = (uint16_t)val;
-  recomputeDerivedConfig();
-  sweepsInCurrentBlock = 0;
-  return true;
+  return recomputeDerivedConfig();
 }
 
-// Reference selection (3.3V only on Teensy 4.1)
 bool handleRef(const String &args) {
   if (args.length() == 0) {
     Serial.println(F("# ERROR: ref requires a value (1.2, 3.3, vdd)"));
@@ -554,14 +513,13 @@ bool handleRef(const String &args) {
   String a = toLowerTrim(args);
 
   if (a == "1.2" || a == "1v2") {
-    // Teensy 4.x has no usable 1.2V internal reference in this library.
-    Serial.println(F("# ERROR: Teensy 4.1 does NOT support 1.2V ADC reference. Use ref 3.3/vdd."));
+    Serial.println(F("# ERROR: Teensy 4.0 does not support internal 1.2V ADC reference. Use ref 3.3 or ref vdd."));
     return false;
   } else if (a == "3.3" || a == "vdd") {
     currentRef = AR_VDD;
-    adc.adc0->setReference(ADC_REFERENCE::REF_3V3);
+    g_configDirty = true;
   } else {
-    Serial.println(F("# ERROR: only ref 3.3/vdd are supported on Teensy 4.1."));
+    Serial.println(F("# ERROR: only ref 3.3 and ref vdd are supported on Teensy 4.0."));
     return false;
   }
 
@@ -569,120 +527,40 @@ bool handleRef(const String &args) {
   return true;
 }
 
-// OSR -> hardware averaging
 bool handleOsr(const String &args) {
   if (args.length() == 0) {
-    Serial.println(F("# ERROR: osr requires an integer (0,1,2,4,8,16,32)"));
+    Serial.println(F("# ERROR: osr requires an integer (2,4,8)"));
     return false;
   }
 
   long o = args.toInt();
-
-  // Valid Teensy averaging values:
-  //   0 = disable averaging
-  //   1,2,4,8,16,32 = allowed by ADC library
-  if (o == 0 || o == 1 || o == 2 || o == 4 || o == 8 || o == 16 || o == 32) {
-    g_osr_cmd      = (uint8_t)o;      // record user command
-    g_adc_averages = (uint16_t)o;     // direct mapping to hardware
-  } else {
-    Serial.println(F("# ERROR: osr must be one of 0,1,2,4,8,16,32 for Teensy 4.1"));
-    return false;
+  if (o == 2 || o == 4 || o == 8) {
+    g_osr_cmd = (uint8_t)o;
+    g_adc_averages = (uint8_t)o;
+    g_configDirty = true;
+    doDummyRead();
+    return true;
   }
 
-  applyADCConfig();
-  doDummyRead();
-  return true;
+  Serial.println(F("# ERROR: osr must be 2, 4, or 8"));
+  return false;
 }
 
-
-// Gain (status-only)
 bool handleGain(const String &args) {
   if (args.length() == 0) {
     Serial.println(F("# ERROR: gain requires an integer (1,2,3,4)"));
     return false;
   }
+
   long g = args.toInt();
-  if (g < 1 || g > 4) {
-    Serial.println(F("# ERROR: gain must be 1, 2, 3, or 4 (status-only on Teensy)."));
-    return false;
-  }
-  g_gain_cmd = (uint8_t)g;
-  doDummyRead();
-  return true;
-}
-
-// Conversion speed
-bool handleConv(const String &args) {
-  if (args.length() == 0) {
-    Serial.println(F("# ERROR: conv requires one of: low, med, high, ad10, ad20"));
-    return false;
+  if (g == 1 || g == 2 || g == 3 || g == 4) {
+    g_gain_cmd = (uint8_t)g;
+    doDummyRead();
+    return true;
   }
 
-  String a = toLowerTrim(args);
-
-  if      (a == "low")  { g_conv_speed = ADC_CONVERSION_SPEED::LOW_SPEED;  }
-  else if (a == "med")  { g_conv_speed = ADC_CONVERSION_SPEED::MED_SPEED;  }
-  else if (a == "high") { g_conv_speed = ADC_CONVERSION_SPEED::HIGH_SPEED; }
-  else if (a == "ad10") { g_conv_speed = ADC_CONVERSION_SPEED::ADACK_10;   }
-  else if (a == "ad20") { g_conv_speed = ADC_CONVERSION_SPEED::ADACK_20;   }
-  else {
-    Serial.println(F("# ERROR: conv must be low, med, high, ad10, or ad20"));
-    return false;
-  }
-
-  applyADCConfig();
-  doDummyRead();
-  return true;
-}
-
-// Sampling speed
-bool handleSamp(const String &args) {
-  if (args.length() == 0) {
-    Serial.println(F("# ERROR: samp requires one of: vlow, low, lmed, med, mhigh, high, hvhigh, vhigh"));
-    return false;
-  }
-
-  String a = toLowerTrim(args);
-
-  if      (a == "vlow")   { g_samp_speed = ADC_SAMPLING_SPEED::VERY_LOW_SPEED;      }
-  else if (a == "low")    { g_samp_speed = ADC_SAMPLING_SPEED::LOW_SPEED;           }
-  else if (a == "lmed")   { g_samp_speed = ADC_SAMPLING_SPEED::LOW_MED_SPEED;       }
-  else if (a == "med")    { g_samp_speed = ADC_SAMPLING_SPEED::MED_SPEED;           }
-  else if (a == "mhigh")  { g_samp_speed = ADC_SAMPLING_SPEED::MED_HIGH_SPEED;      }
-  else if (a == "high")   { g_samp_speed = ADC_SAMPLING_SPEED::HIGH_SPEED;          }
-  else if (a == "hvhigh") { g_samp_speed = ADC_SAMPLING_SPEED::HIGH_VERY_HIGH_SPEED;}
-  else if (a == "vhigh")  { g_samp_speed = ADC_SAMPLING_SPEED::VERY_HIGH_SPEED;     }
-  else {
-    Serial.println(F("# ERROR: samp must be vlow, low, lmed, med, mhigh, high, hvhigh, or vhigh"));
-    return false;
-  }
-
-  applyADCConfig();
-  doDummyRead();
-  return true;
-}
-
-// Sampling rate via IntervalTimer
-bool handleRate(const String &args) {
-  if (args.length() == 0) {
-    Serial.println(F("# ERROR: rate requires 0 or a positive frequency in Hz (e.g. rate 50000)"));
-    return false;
-  }
-
-  long val = args.toInt();
-  if (val < 0) val = 0;
-
-  if (val == 0) {
-    g_sampleRateHz = 0.0f;
-    stopSampleTimer();
-  } else {
-    g_sampleRateHz = (float)val;
-    if (isRunning) {
-      startSampleTimerIfNeeded();
-    }
-  }
-
-  return true;
+  Serial.println(F("# ERROR: gain must be 1, 2, or 3, or 4"));
+  return false;
 }
 
 bool handleRun(const String &args) {
@@ -693,33 +571,33 @@ bool handleRun(const String &args) {
 
   if (args.length() == 0) {
     isRunning = true;
-    timedRun  = false;
+    timedRun = false;
   } else {
     long ms = args.toInt();
     if (ms <= 0) {
       isRunning = true;
-      timedRun  = false;
+      timedRun = false;
     } else {
-      isRunning     = true;
-      timedRun      = true;
+      isRunning = true;
+      timedRun = true;
       runStopMillis = millis() + (uint32_t)ms;
     }
   }
 
-  sweepsInCurrentBlock = 0;
-  recomputeDerivedConfig();
-
-  if (g_sampleRateHz > 0.0f) {
-    startSampleTimerIfNeeded();
+  if (!recomputeDerivedConfig()) {
+    isRunning = false;
+    timedRun = false;
+    return false;
   }
 
+  g_configDirty = true;
+  discardWarmupSweeps(ADC_WARMUP_SWEEPS);
   return true;
 }
 
 void handleStop() {
   isRunning = false;
-  timedRun  = false;
-  stopSampleTimer();
+  timedRun = false;
 }
 
 // ---------------------------------------------------------------------
@@ -727,8 +605,7 @@ void handleStop() {
 // ---------------------------------------------------------------------
 
 void printMcu() {
-  // Single line so the GUI can parse easily
-  Serial.println(F("# Teensy4.1"));
+  Serial.println(F("# TEENSY40"));
 }
 
 void printStatus() {
@@ -758,57 +635,35 @@ void printStatus() {
   Serial.print(F("# useGroundBeforeEach: "));
   Serial.println(useGroundBeforeEach ? F("true") : F("false"));
 
-  Serial.print(F("# adcReference (Teensy 4.1 HW): 3.3V (VDD)\n"));
+  Serial.print(F("# adcReference: "));
+  switch (currentRef) {
+    case AR_INTERNAL1V2:   Serial.println(F("INTERNAL1V2")); break;
+    case AR_EXTERNAL_1V25: Serial.println(F("EXTERNAL_1V25")); break;
+    case AR_VDD:           Serial.println(F("VDD")); break;
+    case AR_08VDD:         Serial.println(F("0.8*VDD")); break;
+    default:               Serial.println(F("UNKNOWN")); break;
+  }
 
-  Serial.print(F("# osr command: "));
-  Serial.print(g_osr_cmd);
-  Serial.print(F(" (averaging = "));
-  Serial.print(g_adc_averages);
-  Serial.println(F(" samples)"));
+  Serial.print(F("# osr (high-speed): "));
+  Serial.println(g_osr_cmd);
 
-  Serial.print(F("# gain command: "));
+  Serial.print(F("# gain: "));
   Serial.print(g_gain_cmd);
-  Serial.println(F("x (status-only, no HW gain)"));
-
-  Serial.print(F("# conv speed: "));
-  // crude print of enum (by name)
-  if      (g_conv_speed == ADC_CONVERSION_SPEED::LOW_SPEED)  Serial.println(F("LOW_SPEED"));
-  else if (g_conv_speed == ADC_CONVERSION_SPEED::MED_SPEED)  Serial.println(F("MED_SPEED"));
-  else if (g_conv_speed == ADC_CONVERSION_SPEED::HIGH_SPEED) Serial.println(F("HIGH_SPEED"));
-  else if (g_conv_speed == ADC_CONVERSION_SPEED::ADACK_10)   Serial.println(F("ADACK_10"));
-  else if (g_conv_speed == ADC_CONVERSION_SPEED::ADACK_20)   Serial.println(F("ADACK_20"));
-  else                                                       Serial.println(F("OTHER"));
-
-  Serial.print(F("# samp speed: "));
-  if      (g_samp_speed == ADC_SAMPLING_SPEED::VERY_LOW_SPEED)       Serial.println(F("VERY_LOW_SPEED"));
-  else if (g_samp_speed == ADC_SAMPLING_SPEED::LOW_SPEED)            Serial.println(F("LOW_SPEED"));
-  else if (g_samp_speed == ADC_SAMPLING_SPEED::LOW_MED_SPEED)        Serial.println(F("LOW_MED_SPEED"));
-  else if (g_samp_speed == ADC_SAMPLING_SPEED::MED_SPEED)            Serial.println(F("MED_SPEED"));
-  else if (g_samp_speed == ADC_SAMPLING_SPEED::MED_HIGH_SPEED)       Serial.println(F("MED_HIGH_SPEED"));
-  else if (g_samp_speed == ADC_SAMPLING_SPEED::HIGH_SPEED)           Serial.println(F("HIGH_SPEED"));
-  else if (g_samp_speed == ADC_SAMPLING_SPEED::HIGH_VERY_HIGH_SPEED) Serial.println(F("HIGH_VERY_HIGH_SPEED"));
-  else if (g_samp_speed == ADC_SAMPLING_SPEED::VERY_HIGH_SPEED)      Serial.println(F("VERY_HIGH_SPEED"));
-  else                                                               Serial.println(F("OTHER"));
-
-  Serial.print(F("# sampleRateHz (0=free-run): "));
-  Serial.println(g_sampleRateHz, 2);
+  Serial.println(F("x"));
 
   Serial.print(F("# samplesPerSweep (sent): "));
   Serial.println(samplesPerSweep);
 
-  Serial.print(F("# scanEntriesPerSweep (logical incl. ground): "));
+  Serial.print(F("# scanEntriesPerSweep (IADC incl. ground): "));
   Serial.println(scanEntriesPerSweep);
 
   Serial.print(F("# sweepsPerBlock: "));
   Serial.println(sweepsPerBlock);
 
-  Serial.print(F("# sweepsInCurrentBlock: "));
-  Serial.println(sweepsInCurrentBlock);
-
   Serial.print(F("# MAX_SAMPLES_BUFFER: "));
   Serial.println(MAX_SAMPLES_BUFFER);
 
-  Serial.print(F("# MAX_SCAN_ENTRIES (informational): "));
+  Serial.print(F("# MAX_SCAN_ENTRIES (hardware limit): "));
   Serial.println(MAX_SCAN_ENTRIES);
 
   Serial.println(F("# -------------------------"));
@@ -817,24 +672,20 @@ void printStatus() {
 void printHelp() {
   Serial.println(F("# Commands:"));
   Serial.println(F("#   channels 0,1,1,1,2,2,3,4,5"));
-  Serial.println(F("#   ground 2                 (set ground pin)"));
-  Serial.println(F("#   ground true|false        (insert ground dummy before each new channel)"));
-  Serial.println(F("#   repeat 20                (samples per channel per sweep)"));
-  Serial.println(F("#   buffer 10                (sweeps per binary block)"));
-  Serial.println(F("#   ref 3.3 | vdd            (set ADC reference to 3.3V VDD)"));
-  Serial.println(F("#   ref 1.2                  (ERROR: not supported on Teensy 4.1)"));
-  Serial.println(F("#   osr 2|4|8                (set hardware averaging)"));
-  Serial.println(F("#   gain 1|2|3|4             (status-only gain multiplier)"));
-  Serial.println(F("#   conv low|med|high|ad10|ad20    (conversion speed)"));
-  Serial.println(F("#   samp vlow|low|lmed|med|mhigh|high|hvhigh|vhigh (sampling speed)"));
-  Serial.println(F("#   rate 0                  (free-run as fast as possible)"));
-  Serial.println(F("#   rate 50000              (target ~50k samples/s via timer)"));
-  Serial.println(F("#   run                     (continuous until 'stop')"));
-  Serial.println(F("#   run 100                 (~100 ms time-limited run)"));
-  Serial.println(F("#   stop                    (stop running)"));
-  Serial.println(F("#   status                  (show configuration)"));
-  Serial.println(F("#   mcu                     (print MCU name for GUI detection)"));
-  Serial.println(F("#   help                    (this message)"));
+  Serial.println(F("#   ground 2              (set ground pin)"));
+  Serial.println(F("#   ground true|false     (insert ground dummy before each new channel)"));
+  Serial.println(F("#   repeat 20             (samples per channel per sweep)"));
+  Serial.println(F("#   buffer 10             (sweeps per binary block)"));
+  Serial.println(F("#   ref 1.2 | 3.3 | vdd   (set ADC reference)"));
+  Serial.println(F("#   osr 2|4|8             (set high-speed oversampling)"));
+  Serial.println(F("#   gain 1|2|3|4          (set analog gain multiplier)"));
+  Serial.println(F("#   run                   (continuous until 'stop')"));
+  Serial.println(F("#   run 100               (~100 ms time-limited run)"));
+  Serial.println(F("#   stop                  (stop running)"));
+  Serial.println(F("#   status                (show configuration)"));
+  Serial.println(F("#   mcu                   (print MCU name for GUI detection)"));
+  Serial.println(F("#   help                  (this message)"));
+  Serial.println(F("# Note: on Teensy 4.0, ref 1.2 returns an error; osr maps to averaging; gain is compatibility-only."));
 }
 
 // ---------------------------------------------------------------------
@@ -852,21 +703,18 @@ void handleLine(const String &lineRaw) {
 
   bool ok = true;
 
-  if      (cmd == "channels")    { ok = handleChannels(args); }
-  else if (cmd == "ground")      { ok = handleGround(args); }
-  else if (cmd == "repeat")      { ok = handleRepeat(args); }
-  else if (cmd == "buffer")      { ok = handleBuffer(args); }
-  else if (cmd == "ref")         { ok = handleRef(args); }
-  else if (cmd == "osr")         { ok = handleOsr(args); }
-  else if (cmd == "gain")        { ok = handleGain(args); }
-  else if (cmd == "conv")        { ok = handleConv(args); }
-  else if (cmd == "samp")        { ok = handleSamp(args); }
-  else if (cmd == "rate")        { ok = handleRate(args); }
-  else if (cmd == "run")         { ok = handleRun(args); }
-  else if (cmd == "stop")        { handleStop(); ok = true; }
-  else if (cmd == "status")      { printStatus(); ok = true; }
-  else if (cmd == "mcu")         { printMcu();   ok = true; }
-  else if (cmd == "help")        { printHelp();  ok = true; }
+  if      (cmd == "channels") { ok = handleChannels(args); }
+  else if (cmd == "ground")   { ok = handleGround(args); }
+  else if (cmd == "repeat")   { ok = handleRepeat(args); }
+  else if (cmd == "buffer")   { ok = handleBuffer(args); }
+  else if (cmd == "ref")      { ok = handleRef(args); }
+  else if (cmd == "osr")      { ok = handleOsr(args); }
+  else if (cmd == "gain")     { ok = handleGain(args); }
+  else if (cmd == "run")      { ok = handleRun(args); }
+  else if (cmd == "stop")     { handleStop(); ok = true; }
+  else if (cmd == "status")   { printStatus(); ok = true; }
+  else if (cmd == "mcu")      { printMcu(); ok = true; }
+  else if (cmd == "help")     { printHelp(); ok = true; }
   else {
     Serial.print(F("# ERROR: unknown command '"));
     Serial.print(cmd);
@@ -884,17 +732,15 @@ void handleLine(const String &lineRaw) {
 void setup() {
   Serial.begin(BAUD_RATE);
   while (!Serial) {
-    // wait for USB serial
+    ;
   }
 
-  // Basic ADC configuration
+  (void)recomputeDerivedConfig();
   applyADCConfig();
-
-  recomputeDerivedConfig();
+  g_configDirty = true;
 }
 
 void loop() {
-  // 1) Handle incoming serial bytes (command parser)
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
 
@@ -918,19 +764,16 @@ void loop() {
     }
   }
 
-  // 2) Handle timed run stop BETWEEN blocks
   if (isRunning && timedRun) {
     uint32_t now = millis();
     if ((int32_t)(now - runStopMillis) >= 0) {
       isRunning = false;
-      timedRun  = false;
-      stopSampleTimer();
-      return;   // don't start a new block
+      timedRun = false;
+      return;
     }
   }
 
-  // 3) Run a whole block if we're in run mode
   if (isRunning) {
-    doOneBlock();   // captures entire block, then sends it
+    doOneBlock();
   }
 }
