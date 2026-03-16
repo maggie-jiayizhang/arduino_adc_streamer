@@ -258,6 +258,9 @@ class ShearPanelMixin:
         self.shear_plot.getViewBox().sigResized.connect(self._on_shear_view_resized)
 
         self.shear_image = pg.ImageItem()
+        self.shear_plot.addItem(self.shear_image)
+        self.shear_image.setColorMap(pg.colormap.get("viridis"))
+        self.shear_image.setImage(np.full((self.shear_plot_height, self.shear_plot_width), np.nan, dtype=np.float32), autoLevels=False, levels=(0, 1))
         self.shear_image.setRect(
             QRectF(
                 -self.SHEAR_VIEW_EXTENT,
@@ -266,9 +269,6 @@ class ShearPanelMixin:
                 2.0 * self.SHEAR_VIEW_EXTENT,
             )
         )
-        self.shear_plot.addItem(self.shear_image)
-        self.shear_image.setLookupTable(self._build_shear_lookup_table())
-        self.shear_image.setImage(np.zeros((self.shear_plot_height, self.shear_plot_width), dtype=np.float32), autoLevels=False, levels=(0, 1))
 
         self.shear_arrow_line = pg.PlotDataItem([], [], pen=pg.mkPen((235, 80, 60), width=3))
         self.shear_arrow_line.setZValue(10)
@@ -373,10 +373,7 @@ class ShearPanelMixin:
         if lut.shape[0] > 0:
             lut[0] = [0, 0, 0, 0]
         if lut.shape[0] > 1:
-            ramp = np.linspace(0.0, 1.0, lut.shape[0], dtype=np.float64)
-            alpha = np.clip((ramp - 0.08) / 0.35, 0.0, 1.0) ** 1.6
-            lut[:, 3] = np.round(alpha * 255.0).astype(np.uint8)
-            lut[0, 3] = 0
+            lut[1:, 3] = 255
         return lut
 
     def _add_shear_background_overlay(self):
@@ -589,7 +586,7 @@ class ShearPanelMixin:
 
         viz_layout.addWidget(QLabel("Intensity Scale:"), 1, 0)
         self.shear_intensity_scale_spin = QDoubleSpinBox()
-        self.shear_intensity_scale_spin.setRange(0.0, 10.0)
+        self.shear_intensity_scale_spin.setRange(0.0, 500.0)
         self.shear_intensity_scale_spin.setDecimals(6)
         self.shear_intensity_scale_spin.setSingleStep(0.01)
         self.shear_intensity_scale_spin.setValue(SHEAR_INTENSITY_SCALE)
@@ -629,7 +626,18 @@ class ShearPanelMixin:
         }
 
     def update_shear_display(self, heatmap, result):
-        self.shear_image.setImage(heatmap, autoLevels=False, levels=(0, 1))
+        circle_mask = (self.shear_x_grid ** 2 + self.shear_y_grid ** 2) <= (self.SHEAR_SENSOR_RADIUS ** 2)
+        masked_heatmap = np.where(circle_mask, heatmap, 0.0)
+        display_heatmap = np.where(masked_heatmap > 0.0, np.power(masked_heatmap, 0.5), np.nan)
+        self.shear_image.setImage(display_heatmap.T, autoLevels=False, levels=(0, 1))
+        self.shear_image.setRect(
+            QRectF(
+                -self.SHEAR_VIEW_EXTENT,
+                -self.SHEAR_VIEW_EXTENT,
+                2.0 * self.SHEAR_VIEW_EXTENT,
+                2.0 * self.SHEAR_VIEW_EXTENT,
+            )
+        )
 
         arrow_scale = self.shear_arrow_scale_spin.value()
         arrow_end_x = result.shear_x * arrow_scale
@@ -655,7 +663,9 @@ class ShearPanelMixin:
             self.shear_arrow_line.setData([], [])
             self.shear_arrow_line.setVisible(False)
             self.shear_arrow_head.setVisible(False)
-        self.shear_cop_marker.setData([result.cop_x], [result.cop_y])
+        display_cop_x = float(result.cop_x) * self.SHEAR_SENSOR_RADIUS
+        display_cop_y = float(result.cop_y) * self.SHEAR_SENSOR_RADIUS
+        self.shear_cop_marker.setData([display_cop_x], [display_cop_y])
 
         self.shear_magnitude_label.setText(f"Magnitude: {result.shear_magnitude:.3f}")
         self.shear_angle_label.setText(f"Angle: {result.shear_angle_deg:+.1f} deg")

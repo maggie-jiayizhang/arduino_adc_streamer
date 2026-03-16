@@ -15,6 +15,7 @@ from data_processing.shear_cop_processor import (
     SHEAR_SENSOR_ORDER,
     ShearCoPProcessor,
     generate_gaussian_blob,
+    shift_residuals_to_positive,
 )
 
 
@@ -85,12 +86,19 @@ class ShearProcessorMixin:
             return None
 
         result = self.shear_processor.process(sensor_streams, sample_rate_hz, settings)
-        amplitude = min(1.0, result.total_weight * float(settings.get("intensity_scale", 1.0)))
+        display_radius = float(getattr(self, "SHEAR_SENSOR_RADIUS", 1.0))
+        display_cop_x = float(result.cop_x) * display_radius
+        display_cop_y = float(result.cop_y) * display_radius
+
+        residual_weights = shift_residuals_to_positive(result.residual_values)
+        residual_intensity = float(sum(residual_weights.values()))
+        signal_ref = max(float(settings.get("confidence_signal_ref", 0.02)), 1e-9)
+        amplitude = float(np.clip((residual_intensity / signal_ref) * float(settings.get("intensity_scale", 1.0)), 0.0, 1.0))
         blob = generate_gaussian_blob(
             self.shear_x_grid,
             self.shear_y_grid,
-            result.cop_x,
-            result.cop_y,
+            display_cop_x,
+            display_cop_y,
             float(settings.get("blob_sigma_x", 0.18)),
             float(settings.get("blob_sigma_y", 0.18)),
             amplitude,
