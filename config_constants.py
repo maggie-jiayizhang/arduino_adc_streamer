@@ -280,6 +280,7 @@ HEATMAP_CHANNEL_SENSOR_MAP = list(DEFAULT_SENSOR_CONFIGURATION["channel_sensor_m
 
 # Expected number of channels for heatmap
 HEATMAP_REQUIRED_CHANNELS = 5
+MAX_SENSOR_PACKAGES = 4
 
 # 555 analyzer 4-sensor displacement heatmap mapping (no center sensor)
 # Channel order maps to sensor labels used by the 555 heatmap pipeline.

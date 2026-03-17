@@ -18,7 +18,7 @@ from config_constants import (
 class PiezoHeatmapProcessorMixin:
     """Piezoelectric (5-sensor) heatmap processing pipeline."""
 
-    def calculate_cop_and_intensity(self, sensor_values, settings):
+    def calculate_cop_and_intensity(self, sensor_values, settings, package_index=0):
         """Calculate center of pressure and intensity from sensor values."""
         weights = np.maximum(np.array(sensor_values, dtype=np.float32), 0.0)
         intensity = np.sum(weights)
@@ -28,13 +28,17 @@ class PiezoHeatmapProcessorMixin:
         cop_y = np.sum(np.array(SENSOR_POS_Y, dtype=np.float32) * weights) / total_weight
 
         smooth_alpha = settings.get('smooth_alpha', SMOOTH_ALPHA)
-        self.smoothed_cop_x = smooth_alpha * cop_x + (1 - smooth_alpha) * self.smoothed_cop_x
-        self.smoothed_cop_y = smooth_alpha * cop_y + (1 - smooth_alpha) * self.smoothed_cop_y
-        self.smoothed_intensity = smooth_alpha * intensity + (1 - smooth_alpha) * self.smoothed_intensity
+        self.smoothed_cop_x[package_index] = smooth_alpha * cop_x + (1 - smooth_alpha) * self.smoothed_cop_x[package_index]
+        self.smoothed_cop_y[package_index] = smooth_alpha * cop_y + (1 - smooth_alpha) * self.smoothed_cop_y[package_index]
+        self.smoothed_intensity[package_index] = smooth_alpha * intensity + (1 - smooth_alpha) * self.smoothed_intensity[package_index]
 
-        return self.smoothed_cop_x, self.smoothed_cop_y, self.smoothed_intensity
+        return (
+            self.smoothed_cop_x[package_index],
+            self.smoothed_cop_y[package_index],
+            self.smoothed_intensity[package_index],
+        )
 
-    def generate_heatmap(self, cop_x, cop_y, intensity, settings):
+    def generate_heatmap(self, cop_x, cop_y, intensity, settings, package_index=0):
         """Generate 2D Gaussian heatmap centered at CoP."""
         dx = self.heatmap_x_grid - cop_x
         dy = self.heatmap_y_grid - cop_y
@@ -49,14 +53,14 @@ class PiezoHeatmapProcessorMixin:
         gaussian = np.exp(-(dx**2 / (2 * sigma_x**2) + dy**2 / (2 * sigma_y**2)))
 
         amplitude = intensity * settings.get('intensity_scale', INTENSITY_SCALE)
-        self.heatmap_buffer[:] = gaussian * amplitude
-        np.clip(self.heatmap_buffer, 0, 1, out=self.heatmap_buffer)
+        self.heatmap_buffers[package_index][:] = gaussian * amplitude
+        np.clip(self.heatmap_buffers[package_index], 0, 1, out=self.heatmap_buffers[package_index])
 
-        return self.heatmap_buffer
+        return self.heatmap_buffers[package_index]
 
-    def process_sensor_data_for_heatmap(self, sensor_values, settings):
+    def process_sensor_data_for_heatmap(self, sensor_values, settings, package_index=0):
         """Complete piezo processing pipeline: sensor values -> heatmap."""
-        cop_x, cop_y, intensity = self.calculate_cop_and_intensity(sensor_values, settings)
+        cop_x, cop_y, intensity = self.calculate_cop_and_intensity(sensor_values, settings, package_index=package_index)
 
         weights = np.maximum(np.array(sensor_values, dtype=np.float32), 0.0)
         confidence, concentration = self.calculate_confidence(weights, intensity, settings)
@@ -81,7 +85,7 @@ class PiezoHeatmapProcessorMixin:
         settings['sigma_scale_x'] = sigma_scale_x
         settings['sigma_scale_y'] = sigma_scale_y
 
-        heatmap = self.generate_heatmap(cop_x, cop_y, intensity, settings)
+        heatmap = self.generate_heatmap(cop_x, cop_y, intensity, settings, package_index=package_index)
         return heatmap, cop_x, cop_y, intensity, confidence, sensor_values
 
     def calculate_confidence(self, weights, intensity, settings):
@@ -147,7 +151,7 @@ class PiezoHeatmapProcessorMixin:
         return data_array, timestamps, avg_sample_time_us
 
     def compute_channel_intensities(self, settings):
-        if not hasattr(self, 'heatmap_signal_processor'):
+        if not hasattr(self, 'heatmap_signal_processors'):
             return None
 
         extract_result = self._extract_heatmap_window_data(settings.get('rms_window_ms', 200))
@@ -166,58 +170,69 @@ class PiezoHeatmapProcessorMixin:
             if ch not in unique_channels:
                 unique_channels.append(ch)
 
-        if len(unique_channels) != HEATMAP_REQUIRED_CHANNELS:
+        if (
+            len(unique_channels) < HEATMAP_REQUIRED_CHANNELS
+            or len(unique_channels) % HEATMAP_REQUIRED_CHANNELS != 0
+        ):
             return None
 
-        channel_samples = []
-        for channel in unique_channels:
-            positions = [i for i, c in enumerate(channels) if c == channel]
-            channel_data_list = []
-            for pos in positions:
-                start_idx = pos * repeat_count
-                end_idx = start_idx + repeat_count
-                if end_idx > data_array.shape[1]:
-                    continue
-                pos_data = data_array[:, start_idx:end_idx]
-                channel_data_list.append(pos_data.reshape(-1))
-
-            if channel_data_list:
-                channel_samples.append(np.concatenate(channel_data_list))
-            else:
-                channel_samples.append(np.array([], dtype=np.float64))
+        package_count = len(unique_channels) // HEATMAP_REQUIRED_CHANNELS
 
         sample_rate_hz = 1000000.0 / avg_sample_time_us
         per_channel_rate_hz = sample_rate_hz / max(len(unique_channels), 1)
-
-        self.heatmap_signal_processor.set_hpf_cutoff(settings.get('hpf_cutoff_hz', 0.0))
         window_end_time_sec = float(timestamps[-1]) if timestamps.size else None
-        rms_values, _ = self.heatmap_signal_processor.compute_rms(
-            channel_samples,
-            settings.get('dc_removal_mode', 'bias'),
-            per_channel_rate_hz,
-            window_end_time_sec,
-        )
-
         channel_to_sensor = settings.get('channel_sensor_map', [])
         sensor_labels = ['T', 'B', 'R', 'L', 'C']
-        sensor_values_map = {label: 0.0 for label in sensor_labels}
-        for idx, sensor_label in enumerate(channel_to_sensor):
-            if idx < len(rms_values):
-                sensor_values_map[sensor_label] = rms_values[idx]
+        package_sensor_values = []
 
-        sensor_values = [sensor_values_map[label] for label in sensor_labels]
+        for package_index in range(package_count):
+            package_channels = unique_channels[
+                package_index * HEATMAP_REQUIRED_CHANNELS:(package_index + 1) * HEATMAP_REQUIRED_CHANNELS
+            ]
+            channel_samples = []
+            for channel in package_channels:
+                positions = [i for i, c in enumerate(channels) if c == channel]
+                channel_data_list = []
+                for pos in positions:
+                    start_idx = pos * repeat_count
+                    end_idx = start_idx + repeat_count
+                    if end_idx > data_array.shape[1]:
+                        continue
+                    pos_data = data_array[:, start_idx:end_idx]
+                    channel_data_list.append(pos_data.reshape(-1))
 
-        noise_floor = settings.get('sensor_noise_floor', [0.0] * len(sensor_values))
-        calibration = settings.get('sensor_calibration', [1.0] * len(sensor_values))
-        calibrated = []
-        for value, noise, gain in zip(sensor_values, noise_floor, calibration):
-            adjusted = max(0.0, value - noise)
-            calibrated.append(adjusted * gain)
+                if channel_data_list:
+                    channel_samples.append(np.concatenate(channel_data_list))
+                else:
+                    channel_samples.append(np.array([], dtype=np.float64))
 
-        smoothed = self.heatmap_signal_processor.smooth_and_threshold(
-            calibrated,
-            settings.get('smooth_alpha', SMOOTH_ALPHA),
-            settings.get('magnitude_threshold', 0.0),
-        )
+            processor = self.heatmap_signal_processors[package_index]
+            processor.set_hpf_cutoff(settings.get('hpf_cutoff_hz', 0.0))
+            rms_values, _ = processor.compute_rms(
+                channel_samples,
+                settings.get('dc_removal_mode', 'bias'),
+                per_channel_rate_hz,
+                window_end_time_sec,
+            )
 
-        return smoothed
+            sensor_values_map = {label: 0.0 for label in sensor_labels}
+            for idx, sensor_label in enumerate(channel_to_sensor):
+                if idx < len(rms_values):
+                    sensor_values_map[sensor_label] = rms_values[idx]
+
+            sensor_values = [sensor_values_map[label] for label in sensor_labels]
+            noise_floor = settings.get('sensor_noise_floor', [0.0] * len(sensor_values))
+            calibration = settings.get('sensor_calibration', [1.0] * len(sensor_values))
+            calibrated = []
+            for value, noise, gain in zip(sensor_values, noise_floor, calibration):
+                adjusted = max(0.0, value - noise)
+                calibrated.append(adjusted * gain)
+
+            smoothed = processor.smooth_and_threshold(
+                calibrated,
+                settings.get('smooth_alpha', SMOOTH_ALPHA),
+                settings.get('magnitude_threshold', 0.0),
+            )
+            package_sensor_values.append(smoothed)
+
+        return package_sensor_values

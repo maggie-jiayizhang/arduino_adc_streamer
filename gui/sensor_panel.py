@@ -337,11 +337,16 @@ class SensorPanelMixin:
 
     def refresh_sensor_mapping_usage(self):
         if hasattr(self, "smoothed_cop_x"):
-            self.smoothed_cop_x = 0.0
-            self.smoothed_cop_y = 0.0
-            self.smoothed_intensity = 0.0
-        if hasattr(self, "heatmap_signal_processor"):
-            self.heatmap_signal_processor.reset()
+            if isinstance(self.smoothed_cop_x, list):
+                self.smoothed_cop_x = [0.0 for _ in self.smoothed_cop_x]
+                self.smoothed_cop_y = [0.0 for _ in self.smoothed_cop_y]
+                self.smoothed_intensity = [0.0 for _ in self.smoothed_intensity]
+            else:
+                self.smoothed_cop_x = 0.0
+                self.smoothed_cop_y = 0.0
+                self.smoothed_intensity = 0.0
+        for processor in getattr(self, "heatmap_signal_processors", []):
+            processor.reset()
         if hasattr(self, "reset_shear_processing_state"):
             self.reset_shear_processing_state()
         if hasattr(self, "_refresh_heatmap_background_overlay"):

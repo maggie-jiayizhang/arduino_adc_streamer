@@ -245,12 +245,16 @@ class ADCStreamerGUI(
         from data_processing.heatmap_signal_processing import HeatmapSignalProcessor
         
         # Smoothed values for CoP and intensity
-        self.smoothed_cop_x = 0.0
-        self.smoothed_cop_y = 0.0
-        self.smoothed_intensity = 0.0
+        self.smoothed_cop_x = [0.0 for _ in range(MAX_SENSOR_PACKAGES)]
+        self.smoothed_cop_y = [0.0 for _ in range(MAX_SENSOR_PACKAGES)]
+        self.smoothed_intensity = [0.0 for _ in range(MAX_SENSOR_PACKAGES)]
+        self.active_sensor_package_count = 1
         
-        # Pre-allocate heatmap buffer
-        self.heatmap_buffer = np.zeros((HEATMAP_HEIGHT, HEATMAP_WIDTH), dtype=np.float32)
+        # Pre-allocate heatmap buffers
+        self.heatmap_buffers = [
+            np.zeros((HEATMAP_HEIGHT, HEATMAP_WIDTH), dtype=np.float32)
+            for _ in range(MAX_SENSOR_PACKAGES)
+        ]
         
         # Pre-compute coordinate grids for Gaussian blob
         y_coords = np.linspace(-1, 1, HEATMAP_HEIGHT).reshape(-1, 1)
@@ -258,11 +262,14 @@ class ADCStreamerGUI(
         self.heatmap_y_grid = np.tile(y_coords, (1, HEATMAP_WIDTH))
         self.heatmap_x_grid = np.tile(x_coords, (HEATMAP_HEIGHT, 1))
 
-        self.heatmap_signal_processor = HeatmapSignalProcessor(
-            channel_count=HEATMAP_REQUIRED_CHANNELS,
-            bias_duration_sec=BIAS_CALIBRATION_DURATION_SEC,
-            hpf_cutoff_hz=HPF_CUTOFF_HZ,
-        )
+        self.heatmap_signal_processors = [
+            HeatmapSignalProcessor(
+                channel_count=HEATMAP_REQUIRED_CHANNELS,
+                bias_duration_sec=BIAS_CALIBRATION_DURATION_SEC,
+                hpf_cutoff_hz=HPF_CUTOFF_HZ,
+            )
+            for _ in range(MAX_SENSOR_PACKAGES)
+        ]
         self.reset_555_heatmap_state()
         self.last_heatmap_sweep_count = 0
 
@@ -459,12 +466,26 @@ class ADCStreamerGUI(
         num_channels = len(unique_channels)
 
         is_555_mode = self.is_555_analyzer_mode()
-        if current_tab == "Shear":
-            required_channels = HEATMAP_REQUIRED_CHANNELS
+        if is_555_mode:
+            valid_channel_count = num_channels == R_HEATMAP_REQUIRED_CHANNELS
+            sensor_package_count = 1
+            required_channels = str(R_HEATMAP_REQUIRED_CHANNELS)
         else:
-            required_channels = R_HEATMAP_REQUIRED_CHANNELS if is_555_mode else HEATMAP_REQUIRED_CHANNELS
+            valid_channel_count = (
+                num_channels >= HEATMAP_REQUIRED_CHANNELS
+                and num_channels <= HEATMAP_REQUIRED_CHANNELS * MAX_SENSOR_PACKAGES
+                and num_channels % HEATMAP_REQUIRED_CHANNELS == 0
+            )
+            sensor_package_count = max(1, num_channels // HEATMAP_REQUIRED_CHANNELS) if valid_channel_count else 1
+            required_channels = "5, 10, 15, or 20"
 
-        if num_channels != required_channels:
+        self.active_sensor_package_count = sensor_package_count
+        if hasattr(self, "update_visible_heatmap_cards"):
+            self.update_visible_heatmap_cards(sensor_package_count if not is_555_mode else 1)
+        if hasattr(self, "update_visible_shear_cards"):
+            self.update_visible_shear_cards(sensor_package_count if not is_555_mode else 1)
+
+        if not valid_channel_count:
             if current_tab == "Shear":
                 self.show_shear_channel_warning(num_channels, required_channels)
             else:
@@ -476,7 +497,8 @@ class ADCStreamerGUI(
         
         # Reset processing state if capture restarted
         if self.sweep_count < self.last_heatmap_sweep_count:
-            self.heatmap_signal_processor.reset()
+            for processor in getattr(self, "heatmap_signal_processors", []):
+                processor.reset()
             self.reset_555_heatmap_state()
             self.reset_shear_processing_state()
         self.last_heatmap_sweep_count = self.sweep_count
@@ -484,15 +506,14 @@ class ADCStreamerGUI(
 
         if current_tab == "Shear":
             if is_555_mode:
-                self.show_shear_channel_warning(num_channels, HEATMAP_REQUIRED_CHANNELS)
+                self.show_shear_channel_warning(num_channels, "5, 10, 15, or 20")
                 return
 
             processed = self.compute_shear_visualization(self.get_shear_settings())
             if processed is None:
                 return
 
-            shear_heatmap, shear_result = processed
-            self.update_shear_display(shear_heatmap, shear_result)
+            self.update_shear_display(processed)
             return
 
         settings = self.get_heatmap_settings()
@@ -502,18 +523,20 @@ class ADCStreamerGUI(
                 return
             heatmap, cop_x, cop_y, intensity, confidence, sensor_values = processed
         else:
-            sensor_values = self.compute_channel_intensities(settings)
-            if sensor_values is None:
+            sensor_packages = self.compute_channel_intensities(settings)
+            if sensor_packages is None:
                 return
 
-            # Process data and generate heatmap
-            heatmap, cop_x, cop_y, intensity, confidence, sensor_values = self.process_sensor_data_for_heatmap(
-                sensor_values,
-                settings,
-            )
+            package_results = [
+                self.process_sensor_data_for_heatmap(sensor_values, settings, package_index=index)
+                for index, sensor_values in enumerate(sensor_packages)
+            ]
         
         # Update display
-        self.update_heatmap_display(heatmap, cop_x, cop_y, intensity, confidence, sensor_values)
+        if is_555_mode:
+            self.update_heatmap_display([(heatmap, cop_x, cop_y, intensity, confidence, sensor_values)])
+        else:
+            self.update_heatmap_display(package_results)
 
 
 def main():
