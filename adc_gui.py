@@ -85,6 +85,7 @@ class ADCStreamerGUI(
         self._init_timing_state()
         self._init_config_state()
         self._init_ui_state()
+        self.init_sensor_config_state()
         self._init_heatmap_state()
         self._init_shear_state()
         self._init_spectrum_state()
@@ -92,6 +93,7 @@ class ADCStreamerGUI(
 
         # Build user interface
         self.init_ui()
+        self._refresh_sensor_tab_ui()
         self.load_last_heatmap_settings()
         self.enable_heatmap_settings_autosave()
         self.load_last_shear_settings()

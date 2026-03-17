@@ -265,14 +265,18 @@ BIAS_CALIBRATION_DURATION_SEC = 2.0
 HPF_CUTOFF_HZ = 0.5
 HEATMAP_DC_REMOVAL_MODE = "highpass"  # "bias" or "highpass"
 
-# Channel-to-sensor mapping for heatmap (order of selected channels)
+# Default channel-to-sensor mapping for heatmap and shear.
+# Order is by selected channel index: channel1..channel5 -> sensor location.
 # Example: ["R", "B", "C", "L", "T"] means channel1->Right, channel2->Bottom, ...
-HEATMAP_CHANNEL_SENSOR_MAP_PLUS = ["R", "B", "C", "L", "T"] # Configuration for PLUS sensors
-HEATMAP_CHANNEL_SENSOR_MAP_OCTO = ["R", "C", "B", "L", "T"] # Configuration for Single Octo sensors
-HEATMAP_CHANNEL_SENSOR_MAP_ARRAY_v1_R =  ["C", "R", "B", "L", "T"] # Configuration for array Octo sensors / reveresed
-HEATMAP_CHANNEL_SENSOR_MAP_ARRAY_v1 =  ["T", "L", "B", "R", "C"] # Configuration for array Octo sensors
+SENSOR_LOCATION_CODES = ["T", "R", "C", "L", "B"]
+DEFAULT_SENSOR_CONFIGURATION_NAME = "ARRAY_v1"
+DEFAULT_SENSOR_CONFIGURATION = {
+    "name": DEFAULT_SENSOR_CONFIGURATION_NAME,
+    "channel_sensor_map": ["T", "L", "B", "R", "C"],
+}
 
-HEATMAP_CHANNEL_SENSOR_MAP = HEATMAP_CHANNEL_SENSOR_MAP_ARRAY_v1  # Set the active mapping here based on your sensor configuration
+# Backward-compatible alias for the app's first-run active mapping.
+HEATMAP_CHANNEL_SENSOR_MAP = list(DEFAULT_SENSOR_CONFIGURATION["channel_sensor_map"])
 
 # Expected number of channels for heatmap
 HEATMAP_REQUIRED_CHANNELS = 5

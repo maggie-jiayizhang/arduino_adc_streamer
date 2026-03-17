@@ -29,7 +29,6 @@ from pathlib import Path
 from config_constants import (
     HEATMAP_HEIGHT,
     HEATMAP_WIDTH,
-    HEATMAP_CHANNEL_SENSOR_MAP,
     SHEAR_ARROW_HEAD_LENGTH_AMPLIFIER,
     SHEAR_ARROW_HEAD_LENGTH_BASE_PX,
     SHEAR_ARROW_SCALE,
@@ -398,7 +397,9 @@ class ShearPanelMixin:
         }
         label_to_number = {
             sensor_label: str(index + 1)
-            for index, sensor_label in enumerate(HEATMAP_CHANNEL_SENSOR_MAP)
+            for index, sensor_label in enumerate(
+                self.get_active_channel_sensor_map() if hasattr(self, "get_active_channel_sensor_map") else []
+            )
         }
         for sensor_name, (x_pos, y_pos) in marker_positions.items():
             marker = pg.ScatterPlotItem([x_pos], [y_pos], symbol="s", size=14, brush=pg.mkBrush(230, 230, 230, 200), pen=pg.mkPen(120, 120, 120, 200))
@@ -412,6 +413,20 @@ class ShearPanelMixin:
             label.setZValue(7)
             self.shear_plot.addItem(label, ignoreBounds=True)
             self.shear_marker_labels.append(label)
+
+    def refresh_shear_background_overlay(self):
+        if not hasattr(self, "shear_marker_labels"):
+            return
+
+        active_channel_sensor_map = (
+            self.get_active_channel_sensor_map() if hasattr(self, "get_active_channel_sensor_map") else []
+        )
+        label_to_number = {
+            sensor_label: str(index + 1)
+            for index, sensor_label in enumerate(active_channel_sensor_map)
+        }
+        for sensor_name, label in zip(["R", "B", "C", "L", "T"], self.shear_marker_labels):
+            label.setText(label_to_number.get(sensor_name, sensor_name))
 
     def create_shear_readouts(self):
         group = QGroupBox("Shear Readouts")
@@ -622,7 +637,11 @@ class ShearPanelMixin:
             "blob_sigma_y": self.shear_sigma_y_spin.value(),
             "intensity_scale": self.shear_intensity_scale_spin.value(),
             "arrow_scale": self.shear_arrow_scale_spin.value(),
-            "channel_sensor_map": list(HEATMAP_CHANNEL_SENSOR_MAP),
+            "channel_sensor_map": (
+                self.get_active_channel_sensor_map()
+                if hasattr(self, "get_active_channel_sensor_map")
+                else []
+            ),
         }
 
     def update_shear_display(self, heatmap, result):

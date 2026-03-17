@@ -360,9 +360,9 @@ class HeatmapPanelMixin:
         self.heatmap_marker_items = []
         self.heatmap_marker_labels = []
 
-    def _refresh_heatmap_background_overlay(self):
+    def _refresh_heatmap_background_overlay(self, force=False):
         mode = '555' if (hasattr(self, 'is_555_analyzer_mode') and self.is_555_analyzer_mode()) else 'adc'
-        if getattr(self, 'heatmap_overlay_mode', None) == mode:
+        if getattr(self, 'heatmap_overlay_mode', None) == mode and not force:
             return
 
         self._clear_heatmap_background_overlay()
@@ -389,9 +389,14 @@ class HeatmapPanelMixin:
                 marker_y = center_y - radius * float(y_norm)
                 marker_positions.append((marker_x, marker_y, str(idx)))
         else:
+            active_channel_sensor_map = (
+                self.get_active_channel_sensor_map()
+                if hasattr(self, "get_active_channel_sensor_map")
+                else HEATMAP_CHANNEL_SENSOR_MAP
+            )
             label_to_number = {
                 sensor_label: str(index + 1)
-                for index, sensor_label in enumerate(HEATMAP_CHANNEL_SENSOR_MAP)
+                for index, sensor_label in enumerate(active_channel_sensor_map)
             }
             marker_positions = [
                 (center_x + radius, center_y, label_to_number.get("R", "")),
@@ -732,7 +737,15 @@ class HeatmapPanelMixin:
     def get_heatmap_settings(self):
         dc_mode = "bias" if self.dc_removal_combo.currentIndex() == 0 else "highpass"
         is_555_mode = bool(hasattr(self, 'is_555_analyzer_mode') and self.is_555_analyzer_mode())
-        channel_sensor_map = R_HEATMAP_CHANNEL_SENSOR_MAP if is_555_mode else HEATMAP_CHANNEL_SENSOR_MAP
+        channel_sensor_map = (
+            R_HEATMAP_CHANNEL_SENSOR_MAP
+            if is_555_mode
+            else (
+                self.get_active_channel_sensor_map()
+                if hasattr(self, "get_active_channel_sensor_map")
+                else HEATMAP_CHANNEL_SENSOR_MAP
+            )
+        )
         same_release = bool(hasattr(self, 'r555_same_release_checkbox') and self.r555_same_release_checkbox.isChecked())
         delta_th = self.r555_delta_threshold_spin.value() if hasattr(self, 'r555_delta_threshold_spin') else R_HEATMAP_DELTA_THRESHOLD
         delta_release = delta_th if same_release else (self.r555_delta_release_spin.value() if hasattr(self, 'r555_delta_release_spin') else R_HEATMAP_DELTA_RELEASE_THRESHOLD)
