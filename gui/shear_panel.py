@@ -46,6 +46,19 @@ class ShearPanelMixin:
     SHEAR_VIEW_EXTENT = 1.25
     SHEAR_SENSOR_RADIUS = 0.72
 
+    def _get_channel_group_title(self, package_index):
+        channels = self.config.get("channels", []) if hasattr(self, "config") else []
+        unique_channels = []
+        for channel in channels:
+            if channel not in unique_channels:
+                unique_channels.append(channel)
+        start = package_index * 5
+        end = start + 5
+        group_channels = unique_channels[start:end]
+        if group_channels:
+            return "CH " + ",".join(str(channel) for channel in group_channels)
+        return f"CH Group {package_index + 1}"
+
     def enable_shear_settings_autosave(self):
         self._shear_autosave_enabled = True
 
@@ -146,7 +159,7 @@ class ShearPanelMixin:
             widget.valueChanged.connect(self.save_last_shear_settings)
 
     def _create_shear_card(self, package_index):
-        group = QGroupBox(f"Sensor Package {package_index + 1}")
+        group = QGroupBox(self._get_channel_group_title(package_index))
         layout = QVBoxLayout()
         plot_widget = pg.GraphicsLayoutWidget()
         plot_widget.setBackground("k")
@@ -211,15 +224,15 @@ class ShearPanelMixin:
         screen = QApplication.primaryScreen()
         if screen is not None:
             height = screen.availableGeometry().height()
-            display.setMinimumHeight(max(300, int(height * 0.4)))
-            display.setMaximumHeight(max(300, int(height * 0.75)))
-        layout.addWidget(display, stretch=7)
+            display.setMinimumHeight(max(360, int(height * 0.52)))
+            display.setMaximumHeight(max(360, int(height * 0.88)))
+        layout.addWidget(display, stretch=10)
         settings = self.create_shear_settings()
         self.shear_settings_scroll = QScrollArea()
         self.shear_settings_scroll.setWidgetResizable(True)
         self.shear_settings_scroll.setWidget(settings)
-        self.shear_settings_scroll.setMaximumHeight(320)
-        layout.addWidget(self.shear_settings_scroll, stretch=4)
+        self.shear_settings_scroll.setMaximumHeight(240)
+        layout.addWidget(self.shear_settings_scroll, stretch=2)
         shear_widget.setLayout(layout)
         if hasattr(self, "sync_visualization_capture_buttons"):
             self.sync_visualization_capture_buttons()
@@ -325,6 +338,7 @@ class ShearPanelMixin:
 
     def update_visible_shear_cards(self, visible_count):
         for index, card in enumerate(getattr(self, "shear_cards", [])):
+            card["group"].setTitle(self._get_channel_group_title(index))
             card["group"].setVisible(index < visible_count)
 
     def create_shear_settings(self):
@@ -463,6 +477,7 @@ class ShearPanelMixin:
         circle_mask = (self.shear_x_grid ** 2 + self.shear_y_grid ** 2) <= (self.SHEAR_SENSOR_RADIUS ** 2)
         for index, (heatmap, result) in enumerate(package_results):
             card = self.shear_cards[index]
+            card["group"].setTitle(self._get_channel_group_title(index))
             masked = np.where(circle_mask, heatmap, 0.0)
             display = np.where(masked > 0.0, np.power(masked, 0.5), np.nan)
             card["image"].setImage(display.T, autoLevels=False, levels=(0, 1))

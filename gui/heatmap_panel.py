@@ -24,6 +24,19 @@ from config_constants import (
 
 
 class HeatmapPanelMixin:
+    def _get_channel_group_title(self, package_index):
+        channels = self.config.get("channels", []) if hasattr(self, "config") else []
+        unique_channels = []
+        for channel in channels:
+            if channel not in unique_channels:
+                unique_channels.append(channel)
+        start = package_index * 5
+        end = start + 5
+        group_channels = unique_channels[start:end]
+        if group_channels:
+            return "CH " + ",".join(str(channel) for channel in group_channels)
+        return f"CH Group {package_index + 1}"
+
     def enable_heatmap_settings_autosave(self):
         self._heatmap_autosave_enabled = True
 
@@ -161,7 +174,7 @@ class HeatmapPanelMixin:
         self.save_last_heatmap_settings()
 
     def _create_heatmap_card(self, package_index):
-        group = QGroupBox(f"Sensor Package {package_index + 1}")
+        group = QGroupBox(self._get_channel_group_title(package_index))
         layout = QVBoxLayout()
         plot_widget = pg.GraphicsLayoutWidget()
         plot = plot_widget.addPlot()
@@ -222,15 +235,15 @@ class HeatmapPanelMixin:
         screen = QApplication.primaryScreen()
         if screen is not None:
             height = screen.availableGeometry().height()
-            display.setMinimumHeight(max(240, int(height / 3)))
-            display.setMaximumHeight(max(240, int(height * 0.75)))
-        layout.addWidget(display, stretch=7)
+            display.setMinimumHeight(max(320, int(height * 0.48)))
+            display.setMaximumHeight(max(320, int(height * 0.88)))
+        layout.addWidget(display, stretch=10)
         settings_panel = self.create_heatmap_settings()
         self.heatmap_settings_scroll = QScrollArea()
         self.heatmap_settings_scroll.setWidgetResizable(True)
         self.heatmap_settings_scroll.setWidget(settings_panel)
-        self.heatmap_settings_scroll.setMaximumHeight(420)
-        layout.addWidget(self.heatmap_settings_scroll, stretch=4)
+        self.heatmap_settings_scroll.setMaximumHeight(260)
+        layout.addWidget(self.heatmap_settings_scroll, stretch=2)
         heatmap_widget.setLayout(layout)
         if hasattr(self, "sync_visualization_capture_buttons"):
             self.sync_visualization_capture_buttons()
@@ -312,6 +325,7 @@ class HeatmapPanelMixin:
 
     def update_visible_heatmap_cards(self, visible_count):
         for index, card in enumerate(getattr(self, "heatmap_cards", [])):
+            card["group"].setTitle(self._get_channel_group_title(index))
             card["group"].setVisible(index < visible_count)
 
     def create_heatmap_settings(self):
@@ -538,6 +552,7 @@ class HeatmapPanelMixin:
         for index, result in enumerate(package_results):
             heatmap, cop_x, cop_y, intensity, confidence, sensor_values = result
             card = self.heatmap_cards[index]
+            card["group"].setTitle(self._get_channel_group_title(index))
             card["image"].setImage(heatmap.T, autoLevels=False, levels=(0, 1))
             card["labels"]["cop_x"].setText(f"X: {cop_x:+.3f}")
             card["labels"]["cop_y"].setText(f"Y: {cop_y:+.3f}")
