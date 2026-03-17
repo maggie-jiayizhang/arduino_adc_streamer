@@ -211,6 +211,13 @@ class HeatmapPanelMixin:
     def create_heatmap_tab(self):
         heatmap_widget = QWidget()
         layout = QVBoxLayout()
+        capture_row = QHBoxLayout()
+        capture_row.addStretch()
+        self.heatmap_capture_button = QPushButton("Capture Data")
+        self.heatmap_capture_button.setCheckable(True)
+        self.heatmap_capture_button.toggled.connect(self.set_visualization_capture_data_enabled)
+        capture_row.addWidget(self.heatmap_capture_button)
+        layout.addLayout(capture_row)
         display = self.create_heatmap_display()
         screen = QApplication.primaryScreen()
         if screen is not None:
@@ -225,6 +232,8 @@ class HeatmapPanelMixin:
         self.heatmap_settings_scroll.setMaximumHeight(420)
         layout.addWidget(self.heatmap_settings_scroll, stretch=4)
         heatmap_widget.setLayout(layout)
+        if hasattr(self, "sync_visualization_capture_buttons"):
+            self.sync_visualization_capture_buttons()
         return heatmap_widget
 
     def create_heatmap_display(self):

@@ -26,7 +26,7 @@ import pyqtgraph as pg
 
 from config_constants import (
     MAX_TIMING_SAMPLES, PLOT_UPDATE_FREQUENCY, PLOT_COLORS,
-    MAX_FORCE_SAMPLES, MAX_LOG_LINES, IADC_RESOLUTION_BITS,
+    MAX_FORCE_SAMPLES, MAX_LOG_LINES, IADC_RESOLUTION_BITS, MAX_PLOT_SWEEPS,
     ANALYZER555_DEFAULT_CF_FARADS, ANALYZER555_DEFAULT_RB_OHMS,
     ANALYZER555_DEFAULT_RK_OHMS,
     X_FORCE_SENSOR_TO_NEWTON, Z_FORCE_SENSOR_TO_NEWTON, CACHE_SUBDIR_NAME,
@@ -82,7 +82,7 @@ class DataProcessorMixin(FilterProcessorMixin, SerialParserMixin, BinaryProcesso
             channels = self.config['channels']
             repeat_count = self.config['repeat']
             samples_per_sweep = len(channels) * repeat_count
-            MAX_SAMPLES_TO_DISPLAY = 10000
+            MAX_TOTAL_POINTS_TO_DISPLAY = 12000
             
             # Determine which data to plot - use numpy buffer directly with thread safety!
             if active_data_buffer is None:
@@ -125,7 +125,7 @@ class DataProcessorMixin(FilterProcessorMixin, SerialParserMixin, BinaryProcesso
             elif self.is_capturing:
                 # During capture: show last window_size sweeps
                 window_size = self.window_size_spin.value()
-                window_size = min(window_size, actual_sweeps)
+                window_size = min(window_size, MAX_PLOT_SWEEPS, actual_sweeps)
                 
                 # Use circular buffer logic
                 if actual_sweeps < self.MAX_SWEEPS_BUFFER:
@@ -171,7 +171,7 @@ class DataProcessorMixin(FilterProcessorMixin, SerialParserMixin, BinaryProcesso
                 # After capture: show same window as during capture for consistency
                 # Use the window_size setting so user sees what they were looking at
                 window_size = self.window_size_spin.value()
-                max_sweeps = min(window_size, actual_sweeps)
+                max_sweeps = min(window_size, MAX_PLOT_SWEEPS, actual_sweeps)
                 
                 # Extract from circular buffer
                 if actual_sweeps < self.MAX_SWEEPS_BUFFER:
@@ -208,6 +208,8 @@ class DataProcessorMixin(FilterProcessorMixin, SerialParserMixin, BinaryProcesso
 
             desired_curve_keys = set()
             latest_channel_values = {}
+            visible_series_count = max(1, len(selected_channels))
+            max_samples_per_series = max(500, MAX_TOTAL_POINTS_TO_DISPLAY // visible_series_count)
             
             # Calculate average sample time for intra-sweep timing
             if hasattr(self, 'arduino_sample_times') and self.arduino_sample_times:
@@ -269,8 +271,8 @@ class DataProcessorMixin(FilterProcessorMixin, SerialParserMixin, BinaryProcesso
                     channel_data = (channel_data / max_adc_value) * vref
 
                 # Downsample if too many points for this channel
-                if len(channel_data) > MAX_SAMPLES_TO_DISPLAY:
-                    downsample_factor = len(channel_data) // MAX_SAMPLES_TO_DISPLAY
+                if len(channel_data) > max_samples_per_series:
+                    downsample_factor = max(1, len(channel_data) // max_samples_per_series)
                     channel_data = channel_data[::downsample_factor]
                     channel_times = channel_times[::downsample_factor]
 
@@ -405,7 +407,7 @@ class DataProcessorMixin(FilterProcessorMixin, SerialParserMixin, BinaryProcesso
                 return
             elif self.is_capturing:
                 window_size = self.window_size_spin.value()
-                window_size = min(window_size, actual_sweeps)
+                window_size = min(window_size, MAX_PLOT_SWEEPS, actual_sweeps)
                 
                 if actual_sweeps < self.MAX_SWEEPS_BUFFER:
                     start_idx = max(0, actual_sweeps - window_size)
@@ -734,7 +736,8 @@ class DataProcessorMixin(FilterProcessorMixin, SerialParserMixin, BinaryProcesso
 
         self.is_capturing = True
         if self.serial_thread:
-            self.serial_thread.set_capturing(True)
+            expected_samples_per_sweep = len(self.config.get('channels', [])) * max(1, int(self.config.get('repeat', 1)))
+            self.serial_thread.set_capturing(True, expected_samples_per_sweep=expected_samples_per_sweep)
         
         # Wait for thread to fully switch modes
         time.sleep(0.05)

@@ -200,6 +200,13 @@ class ShearPanelMixin:
     def create_shear_tab(self):
         shear_widget = QWidget()
         layout = QVBoxLayout()
+        capture_row = QHBoxLayout()
+        capture_row.addStretch()
+        self.shear_capture_button = QPushButton("Capture Data")
+        self.shear_capture_button.setCheckable(True)
+        self.shear_capture_button.toggled.connect(self.set_visualization_capture_data_enabled)
+        capture_row.addWidget(self.shear_capture_button)
+        layout.addLayout(capture_row)
         display = self.create_shear_display()
         screen = QApplication.primaryScreen()
         if screen is not None:
@@ -214,6 +221,8 @@ class ShearPanelMixin:
         self.shear_settings_scroll.setMaximumHeight(320)
         layout.addWidget(self.shear_settings_scroll, stretch=4)
         shear_widget.setLayout(layout)
+        if hasattr(self, "sync_visualization_capture_buttons"):
+            self.sync_visualization_capture_buttons()
         return shear_widget
 
     def create_shear_display(self):

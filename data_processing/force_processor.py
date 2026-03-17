@@ -38,7 +38,11 @@ class ForceProcessorMixin:
         x_calibrated = x_force - self.force_calibration_offset['x']
         z_calibrated = z_force - self.force_calibration_offset['z']
         
-        if self.is_capturing and self.force_start_time is not None:
+        store_capture_data = True
+        if hasattr(self, "should_store_capture_data"):
+            store_capture_data = bool(self.should_store_capture_data())
+
+        if self.is_capturing and self.force_start_time is not None and store_capture_data:
             timestamp = time.time() - self.force_start_time
             self.force_data.append((timestamp, x_calibrated, z_calibrated))
             

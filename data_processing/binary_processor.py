@@ -11,7 +11,7 @@ from typing import List
 
 import numpy as np
 
-from config_constants import MAX_TIMING_SAMPLES, PLOT_UPDATE_FREQUENCY
+from config_constants import MAX_TIMING_SAMPLES, PLOT_UPDATE_FREQUENCY, MAX_PLOT_SWEEPS
 
 
 class BinaryProcessorMixin:
@@ -33,6 +33,10 @@ class BinaryProcessorMixin:
         """
         if self.is_capturing:
             try:
+                store_capture_data = True
+                if hasattr(self, "should_store_capture_data"):
+                    store_capture_data = bool(self.should_store_capture_data())
+
                 # Track buffer arrival time (start of reception)
                 block_start_time = time.time()
                 
@@ -124,7 +128,7 @@ class BinaryProcessorMixin:
                     self.block_samples_per_sweep = self.block_samples_per_sweep[-MAX_TIMING_SAMPLES:]
 
                 # Stream block timing to sidecar (if open)
-                if self._block_timing_file:
+                if store_capture_data and self._block_timing_file:
                     try:
                         gap_us = ""
                         if self.mcu_block_gap_us:
@@ -183,7 +187,7 @@ class BinaryProcessorMixin:
                         self.sweep_count += 1
 
                     # Also keep in list for archive writing (only if archive is active)
-                    if self._archive_file:
+                    if store_capture_data and self._archive_file:
                         try:
                             archive_entry = {
                                 'timestamp_s': float(sweep_timestamp_sec),
@@ -200,7 +204,7 @@ class BinaryProcessorMixin:
                             pass
 
                 # Update plot periodically for performance (after processing entire block)
-                if self.sweep_count % PLOT_UPDATE_FREQUENCY == 0:
+                if store_capture_data and self.sweep_count % PLOT_UPDATE_FREQUENCY == 0:
                     self.update_plot()
                     # Update info label based on current view mode - use buffer counts!
                     actual_sweeps = min(self.sweep_count, self.MAX_SWEEPS_BUFFER)
@@ -212,7 +216,7 @@ class BinaryProcessorMixin:
                         )
                     else:
                         window_size = self.window_size_spin.value()
-                        displayed_sweeps = min(actual_sweeps, window_size)
+                        displayed_sweeps = min(actual_sweeps, window_size, MAX_PLOT_SWEEPS)
                         self.plot_info_label.setText(
                             f"ADC - Sweeps: {self.sweep_count} (showing last {displayed_sweeps}) | Samples: {total_samples}  |  Force: {force_samples} samples"
                         )

@@ -18,6 +18,7 @@ class SerialReaderThread(QThread):
         self.serial_port = serial_port
         self.running = True
         self.is_capturing = False
+        self.expected_samples_per_sweep = None
         # Persistent buffer that holds partial binary packets between reads
         self.binary_buffer = bytearray()
 
@@ -36,7 +37,7 @@ class SerialReaderThread(QThread):
                 else:
                     break
 
-                self.msleep(10)  # Small delay to prevent CPU spinning
+                self.msleep(2)  # Keep reads responsive at higher channel counts
 
             except Exception as e:
                 self.error_occurred.emit(f"Serial read error: {e}")
@@ -59,6 +60,14 @@ class SerialReaderThread(QThread):
                     break  # Need more data for header
                 
                 sample_count = buffer[2] | (buffer[3] << 8)
+                expected = self.expected_samples_per_sweep
+                if sample_count <= 0:
+                    buffer = buffer[1:]
+                    continue
+                if expected and sample_count % expected != 0:
+                    # Likely a false header match inside payload or a desynced stream.
+                    buffer = buffer[1:]
+                    continue
                 # New format: header(4) + samples(count*2) + avg_time(2) + block_start_us(4) + block_end_us(4)
                 packet_size = 4 + (sample_count * 2) + 2 + 8
 
@@ -125,9 +134,10 @@ class SerialReaderThread(QThread):
         
         return buffer
 
-    def set_capturing(self, capturing):
+    def set_capturing(self, capturing, expected_samples_per_sweep=None):
         """Set whether we're currently capturing data."""
         self.is_capturing = capturing
+        self.expected_samples_per_sweep = expected_samples_per_sweep if capturing else None
         if not capturing:
             # Drop any partial/queued binary data between captures so timestamps restart clean
             self.binary_buffer.clear()

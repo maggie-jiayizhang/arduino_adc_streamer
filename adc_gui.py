@@ -230,6 +230,8 @@ class ADCStreamerGUI(
         self.force_x_checkbox: Optional[QCheckBox] = None
         self.force_z_checkbox: Optional[QCheckBox] = None
         self._heatmap_autosave_enabled = False
+        self._shear_autosave_enabled = False
+        self.visualization_capture_data_enabled = False
         
         self.is_updating_plot = False
         self._adc_curves = {}
@@ -415,6 +417,50 @@ class ADCStreamerGUI(
             self.start_spectrum_updates()
         else:
             self.stop_spectrum_updates()
+
+        self.sync_visualization_capture_buttons()
+
+    def get_current_visualization_tab_name(self) -> str:
+        """Return the current visualization tab title."""
+        if not hasattr(self, "visualization_tabs") or self.visualization_tabs is None:
+            return ""
+        current_index = self.visualization_tabs.currentIndex()
+        if current_index < 0:
+            return ""
+        return self.visualization_tabs.tabText(current_index)
+
+    def is_live_visualization_only_tab(self) -> bool:
+        """Return True when current tab should avoid time-series capture by default."""
+        return self.get_current_visualization_tab_name() in {"2D Heatmap", "Shear"}
+
+    def should_store_capture_data(self) -> bool:
+        """Return True when capture should persist/archive time-series data."""
+        if not self.is_capturing:
+            return False
+        if self.is_live_visualization_only_tab():
+            return bool(self.visualization_capture_data_enabled)
+        return True
+
+    def set_visualization_capture_data_enabled(self, enabled: bool):
+        """Enable or disable time-series capture while on heatmap/shear tabs."""
+        enabled = bool(enabled)
+        if self.visualization_capture_data_enabled == enabled:
+            self.sync_visualization_capture_buttons()
+            return
+        self.visualization_capture_data_enabled = enabled
+        state_text = "enabled" if enabled else "disabled"
+        self.log_status(f"Visualization tab data capture {state_text}")
+        self.sync_visualization_capture_buttons()
+
+    def sync_visualization_capture_buttons(self):
+        """Keep heatmap/shear Capture Data buttons in sync with shared state."""
+        for attr_name in ("heatmap_capture_button", "shear_capture_button"):
+            button = getattr(self, attr_name, None)
+            if button is None:
+                continue
+            old_block = button.blockSignals(True)
+            button.setChecked(bool(self.visualization_capture_data_enabled))
+            button.blockSignals(old_block)
     
     def start_heatmap_simulation(self):
         """Start heatmap updates."""
