@@ -21,6 +21,8 @@ class SerialReaderThread(QThread):
         self.expected_samples_per_sweep = None
         # Persistent buffer that holds partial binary packets between reads
         self.binary_buffer = bytearray()
+        self._debug_binary_packets_seen = 0
+        self._debug_binary_rejections = 0
 
     def run(self):
         """Continuously read from serial port and emit signals."""
@@ -66,6 +68,11 @@ class SerialReaderThread(QThread):
                     continue
                 if expected and sample_count % expected != 0:
                     # Likely a false header match inside payload or a desynced stream.
+                    if self.is_capturing and self._debug_binary_rejections < 10:
+                        self._debug_binary_rejections += 1
+                        self.error_occurred.emit(
+                            f"Binary packet rejected: sample_count={sample_count}, expected_multiple={expected}"
+                        )
                     buffer = buffer[1:]
                     continue
                 # New format: header(4) + samples(count*2) + avg_time(2) + block_start_us(4) + block_end_us(4)
@@ -76,6 +83,11 @@ class SerialReaderThread(QThread):
                 
                 # Only process and emit if capturing
                 if self.is_capturing:
+                    if self._debug_binary_packets_seen < 10:
+                        self._debug_binary_packets_seen += 1
+                        self.error_occurred.emit(
+                            f"Binary packet accepted: sample_count={sample_count}, expected_multiple={expected}, packet_size={packet_size}"
+                        )
                     # Extract all samples in block (little-endian uint16)
                     samples = []
                     for i in range(sample_count):
@@ -138,6 +150,9 @@ class SerialReaderThread(QThread):
         """Set whether we're currently capturing data."""
         self.is_capturing = capturing
         self.expected_samples_per_sweep = expected_samples_per_sweep if capturing else None
+        if capturing:
+            self._debug_binary_packets_seen = 0
+            self._debug_binary_rejections = 0
         if not capturing:
             # Drop any partial/queued binary data between captures so timestamps restart clean
             self.binary_buffer.clear()

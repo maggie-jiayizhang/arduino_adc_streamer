@@ -33,6 +33,8 @@ class BinaryProcessorMixin:
         """
         if self.is_capturing:
             try:
+                if not hasattr(self, '_debug_capture_blocks_seen'):
+                    self._debug_capture_blocks_seen = 0
                 store_capture_data = True
                 if hasattr(self, "should_store_capture_data"):
                     store_capture_data = bool(self.should_store_capture_data())
@@ -108,6 +110,13 @@ class BinaryProcessorMixin:
                 
                 # Calculate actual sweeps in this block (may be less than requested buffer size)
                 sweeps_in_block = total_samples // samples_per_sweep
+                if self._debug_capture_blocks_seen < 10:
+                    self._debug_capture_blocks_seen += 1
+                    self.log_status(
+                        f"Capture block {self._debug_capture_blocks_seen}: total_samples={total_samples}, "
+                        f"samples_per_sweep={samples_per_sweep}, sweeps_in_block={sweeps_in_block}, "
+                        f"avg_dt_us={avg_sample_time_us}"
+                    )
 
                 block_samples_array = np.array(samples[:total_samples], dtype=np.float32).reshape(sweeps_in_block, samples_per_sweep)
                 total_fs_hz = (1000000.0 / avg_sample_time_us) if avg_sample_time_us > 0 else 0.0

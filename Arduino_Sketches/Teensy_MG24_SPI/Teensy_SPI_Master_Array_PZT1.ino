@@ -54,6 +54,7 @@ static const uint32_t CS_SETUP_US        = 10;
 static const uint32_t SERIAL_BAUD        = 460800;
 static const char     CMD_TERM           = '*';
 static const uint16_t MAX_CMD_LEN        = 512;
+static const bool     DEBUG_TEXT_STREAM  = false; // if true, prints human-readable block info and samples instead of raw bytes
 
 // ── Protocol frame sizes (must match MG24 sketch) ─────────────────────
 static const uint8_t  CMD_FRAME_LEN      = 20;   // fixed command TX frame (bytes)
@@ -68,6 +69,7 @@ static const uint8_t  ACK_STATUS_OK      = 0x00;
 // Time (ms) to wait after sending any non-RUN command before reading the
 // 4-byte ACK.  Covers MG24 command processing time.
 static const uint32_t CONFIG_ACK_DELAY_MS   = 20;
+static const uint32_t INTER_BLOCK_CMD_DELAY_MS = 3;
 
 // ── Timing: MUX settling (must match MG24 MUX_SETTLE_US) ─────────────
 // Used in blockDelayMs() to estimate per-pair capture time.
@@ -167,6 +169,100 @@ static bool spiRecvStreamingResponse(uint8_t *buf, uint16_t len, uint8_t maxAtte
     delay(2 + attempt * 2);
   }
   return false;
+}
+
+static void emitBlockToHost(const uint8_t *buf, uint32_t len) {
+  if (!DEBUG_TEXT_STREAM) {
+    Serial.write(buf, (size_t)len);
+    Serial.flush();
+    return;
+  }
+
+  if (len < (uint32_t)ACK_FRAME_LEN + BLOCK_TRAILER_LEN) {
+    Serial.println(F("#DBG short block"));
+    Serial.flush();
+    return;
+  }
+
+  if (buf[0] != BLOCK_MAGIC1 || buf[1] != BLOCK_MAGIC2) {
+    Serial.print(F("#DBG non-block first bytes: "));
+    Serial.print(buf[0], HEX);
+    Serial.print(' ');
+    Serial.println(buf[1], HEX);
+    Serial.flush();
+    return;
+  }
+
+  uint16_t sampleCount = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+  uint32_t payloadBytes = (uint32_t)sampleCount * 2u;
+  uint32_t trailerOffset = (uint32_t)ACK_FRAME_LEN + payloadBytes;
+  if (trailerOffset + BLOCK_TRAILER_LEN > len) {
+    Serial.println(F("#DBG malformed block length"));
+    Serial.flush();
+    return;
+  }
+
+  uint16_t avgDtUs = (uint16_t)buf[trailerOffset] | ((uint16_t)buf[trailerOffset + 1] << 8);
+  uint32_t blockStartUs =
+      ((uint32_t)buf[trailerOffset + 2])
+    | ((uint32_t)buf[trailerOffset + 3] << 8)
+    | ((uint32_t)buf[trailerOffset + 4] << 16)
+    | ((uint32_t)buf[trailerOffset + 5] << 24);
+  uint32_t blockEndUs =
+      ((uint32_t)buf[trailerOffset + 6])
+    | ((uint32_t)buf[trailerOffset + 7] << 8)
+    | ((uint32_t)buf[trailerOffset + 8] << 16)
+    | ((uint32_t)buf[trailerOffset + 9] << 24);
+
+  Serial.print(F("#DBG block samples="));
+  Serial.print(sampleCount);
+  Serial.print(F(" pairs="));
+  Serial.print(sampleCount / 2u);
+  Serial.print(F(" avg_dt_us="));
+  Serial.print(avgDtUs);
+  Serial.print(F(" start_us="));
+  Serial.print(blockStartUs);
+  Serial.print(F(" end_us="));
+  Serial.println(blockEndUs);
+
+  uint32_t samplesPerSweep = (uint32_t)cfg.channelCount * cfg.repeatCount * 2u;
+  if (samplesPerSweep == 0) {
+    Serial.println(F("#DBG samplesPerSweep=0"));
+    Serial.flush();
+    return;
+  }
+
+  for (uint32_t base = 0; base < sampleCount; base += samplesPerSweep) {
+    Serial.print(F("#DBG sweep "));
+    Serial.print(base / samplesPerSweep);
+    Serial.print(F(": "));
+    for (uint32_t i = 0; i < samplesPerSweep && (base + i) < sampleCount; ++i) {
+      uint32_t byteIdx = (uint32_t)ACK_FRAME_LEN + (base + i) * 2u;
+      uint16_t value = (uint16_t)buf[byteIdx] | ((uint16_t)buf[byteIdx + 1] << 8);
+      Serial.print(value);
+      if (i + 1 < samplesPerSweep && (base + i + 1) < sampleCount) {
+        Serial.print(',');
+      }
+    }
+    Serial.println();
+  }
+  Serial.flush();
+}
+
+// The GUI sends commands terminated with "***". Once handleRun() starts,
+// any extra '*' bytes still pending in the USB serial RX buffer would look
+// like a user-issued stop request unless we discard them first.
+static void discardPendingCommandTerminators(uint32_t settleMs = 10) {
+  uint32_t start = millis();
+  while ((millis() - start) < settleMs) {
+    while (Serial.available() > 0) {
+      char c = (char)Serial.read();
+      if (c != CMD_TERM && c != '\r' && c != '\n') {
+        // Ignore any unexpected trailing bytes from the just-finished command.
+      }
+    }
+    delay(1);
+  }
 }
 
 // Build and send a command frame (always CMD_FRAME_LEN bytes).
@@ -390,10 +486,11 @@ static void handleRun(const String &args) {
 
   cfg.running = true;
   hostAck(true, args); // "#OK <args>" — sent BEFORE data so Python knows streaming started
+  discardPendingCommandTerminators();
 
-  // Forward first block verbatim to Python host
-  Serial.write(rxBuf, (size_t)rBytes);
-  Serial.flush();
+  // Forward first block to host/debug output
+  emitBlockToHost(rxBuf, rBytes);
+  delay(INTER_BLOCK_CMD_DELAY_MS);
 
   uint32_t runStart = millis();
 
@@ -423,6 +520,7 @@ static void handleRun(const String &args) {
       delay(CONFIG_ACK_DELAY_MS);
       uint8_t ack[ACK_FRAME_LEN];
       spiRecvBytes(ack, ACK_FRAME_LEN); // discard
+      delay(INTER_BLOCK_CMD_DELAY_MS);
       break;
     }
 
@@ -434,12 +532,14 @@ static void handleRun(const String &args) {
       delay(CONFIG_ACK_DELAY_MS);
       uint8_t ack[ACK_FRAME_LEN];
       spiRecvBytes(ack, ACK_FRAME_LEN);
+      delay(INTER_BLOCK_CMD_DELAY_MS);
       cfg.running = false;
       break;
     }
 
     // If MG24 returned an error ACK (timed-run expired on MG24 side), stop
     if (rxBuf[0] == ACK_MAGIC) {
+      delay(INTER_BLOCK_CMD_DELAY_MS);
       cfg.running = false; break;
     }
 
@@ -449,11 +549,12 @@ static void handleRun(const String &args) {
       delay(CONFIG_ACK_DELAY_MS);
       uint8_t ack[ACK_FRAME_LEN];
       spiRecvBytes(ack, ACK_FRAME_LEN);
+      delay(INTER_BLOCK_CMD_DELAY_MS);
       cfg.running = false; break;
     }
 
-    Serial.write(rxBuf, (size_t)rBytes);
-    Serial.flush();
+    emitBlockToHost(rxBuf, rBytes);
+    delay(INTER_BLOCK_CMD_DELAY_MS);
   }
 
   cfg.running = false;
