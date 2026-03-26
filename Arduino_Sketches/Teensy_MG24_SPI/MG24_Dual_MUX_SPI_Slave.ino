@@ -92,7 +92,7 @@ static const int PIN_MUX_A2   = D5;   // ADG1206 address bit 2
 static const int PIN_MUX_A3   = D6;   // ADG1206 address bit 3
 
 // ── SPI transport ─────────────────────────────────────────────────────
-static const uint32_t SPI_BITRATE         = 1000000UL; // 1 MHz (same as test3)
+static const uint32_t SPI_BITRATE         = 4000000UL; // 4 MHz
 
 // ── SPIDRV EUSART1 GPIO routing (must match PCB; same as test3) ───────
 // These are raw Silicon Labs port/pin numbers, NOT Arduino Dx numbers.
@@ -195,9 +195,15 @@ static uint8_t cmdRxBuf[CMD_FRAME_LEN];
 static uint8_t cmdTxDummy[CMD_FRAME_LEN]; // zeros, sent while receiving command
 
 // Response phase buffers
-static uint8_t  spiTxBuf[SPI_TX_BUF_SIZE]; // data we send to Teensy
-static uint8_t  spiRxSink[SPI_TX_BUF_SIZE]; // discards dummy bytes master sends during our TX
+static uint8_t  spiTxBufA[SPI_TX_BUF_SIZE];
+static uint8_t  spiTxBufB[SPI_TX_BUF_SIZE];
+static uint8_t  *armedRespBuf = spiTxBufA;   // buffer currently armed for SPI TX
+static uint8_t  *fillRespBuf  = spiTxBufB;   // buffer available for the next captured block
+static uint8_t  spiRxSink[SPI_TX_BUF_SIZE];  // discards dummy bytes master sends during our TX
 static uint32_t respLen = 0;
+static bool     streamRespArmed = false;
+static bool     nextBlockReady  = false;
+static uint32_t nextBlockLen    = 0;
 
 static void armCmd() {
   xferDone   = false;
@@ -208,14 +214,16 @@ static void armCmd() {
   gState = WAIT_CMD;
 }
 
-static void armResp(uint32_t len) {
+static void armResp(uint8_t *txBuf, uint32_t len, bool isStreaming = false) {
   xferDone   = false;
   xferStatus = (Ecode_t)0xFFFFu;
+  armedRespBuf = txBuf;
   respLen    = len;
-  // spiTxBuf  → data to send (ACK or data block)
+  streamRespArmed = isStreaming;
+  // armedRespBuf → data to send (ACK or data block)
   // spiRxSink → receives and discards the dummy bytes master sends during our TX
   //             (using the same buffer for TX and RX would corrupt outgoing data via DMA)
-  SPIDRV_STransfer(&spiHandle, spiTxBuf, spiRxSink,
+  SPIDRV_STransfer(&spiHandle, armedRespBuf, spiRxSink,
                    (int)len, spiCallback, 0);
   gState = RESP_ARMED;
 }
@@ -424,7 +432,7 @@ static void clampSweepsPerBlock() {
 // Captures sweepsPerBlock sweeps. Writes sample pairs into spiTxBuf at
 // offset ACK_FRAME_LEN (= 4), then fills the header and trailer.
 // Returns the number of (MUX1, MUX2) pairs captured.
-static uint32_t captureBlock() {
+static uint32_t captureBlock(uint8_t *txBuf) {
   if (!g_iadcReady || channelCount == 0) return 0;
 
   uint32_t maxPairs = (uint32_t)sweepsPerBlock * channelCount * repeatCount;
@@ -444,10 +452,10 @@ static uint32_t captureBlock() {
 
       if (!entryIsGround[e]) {
         uint32_t off = (uint32_t)ACK_FRAME_LEN + pairIdx * 4u;
-        spiTxBuf[off + 0] = (uint8_t)(v1 & 0xFF);
-        spiTxBuf[off + 1] = (uint8_t)(v1 >> 8);
-        spiTxBuf[off + 2] = (uint8_t)(v2 & 0xFF);
-        spiTxBuf[off + 3] = (uint8_t)(v2 >> 8);
+        txBuf[off + 0] = (uint8_t)(v1 & 0xFF);
+        txBuf[off + 1] = (uint8_t)(v1 >> 8);
+        txBuf[off + 2] = (uint8_t)(v2 & 0xFF);
+        txBuf[off + 3] = (uint8_t)(v2 >> 8);
         pairIdx++;
       }
     }
@@ -460,33 +468,56 @@ static uint32_t captureBlock() {
       ? (uint16_t)min(elapsed / sampleCount, 65535UL) : 0u;
 
   // Header (first 4 bytes of spiTxBuf)
-  spiTxBuf[0] = BLOCK_MAGIC1;
-  spiTxBuf[1] = BLOCK_MAGIC2;
-  spiTxBuf[2] = (uint8_t)(sampleCount & 0xFF);
-  spiTxBuf[3] = (uint8_t)(sampleCount >> 8);
+  txBuf[0] = BLOCK_MAGIC1;
+  txBuf[1] = BLOCK_MAGIC2;
+  txBuf[2] = (uint8_t)(sampleCount & 0xFF);
+  txBuf[3] = (uint8_t)(sampleCount >> 8);
 
   // Trailer immediately after sample data
   uint32_t tOff = (uint32_t)ACK_FRAME_LEN + pairIdx * 4u;
-  spiTxBuf[tOff + 0] = (uint8_t)(avgDtUs & 0xFF);
-  spiTxBuf[tOff + 1] = (uint8_t)(avgDtUs >> 8);
-  spiTxBuf[tOff + 2] = (uint8_t)(blockStart & 0xFF);
-  spiTxBuf[tOff + 3] = (uint8_t)((blockStart >>  8) & 0xFF);
-  spiTxBuf[tOff + 4] = (uint8_t)((blockStart >> 16) & 0xFF);
-  spiTxBuf[tOff + 5] = (uint8_t)((blockStart >> 24) & 0xFF);
-  spiTxBuf[tOff + 6] = (uint8_t)(blockEnd & 0xFF);
-  spiTxBuf[tOff + 7] = (uint8_t)((blockEnd >>  8) & 0xFF);
-  spiTxBuf[tOff + 8] = (uint8_t)((blockEnd >> 16) & 0xFF);
-  spiTxBuf[tOff + 9] = (uint8_t)((blockEnd >> 24) & 0xFF);
+  txBuf[tOff + 0] = (uint8_t)(avgDtUs & 0xFF);
+  txBuf[tOff + 1] = (uint8_t)(avgDtUs >> 8);
+  txBuf[tOff + 2] = (uint8_t)(blockStart & 0xFF);
+  txBuf[tOff + 3] = (uint8_t)((blockStart >>  8) & 0xFF);
+  txBuf[tOff + 4] = (uint8_t)((blockStart >> 16) & 0xFF);
+  txBuf[tOff + 5] = (uint8_t)((blockStart >> 24) & 0xFF);
+  txBuf[tOff + 6] = (uint8_t)(blockEnd & 0xFF);
+  txBuf[tOff + 7] = (uint8_t)((blockEnd >>  8) & 0xFF);
+  txBuf[tOff + 8] = (uint8_t)((blockEnd >> 16) & 0xFF);
+  txBuf[tOff + 9] = (uint8_t)((blockEnd >> 24) & 0xFF);
 
   return pairIdx;
 }
 
 // ── ACK helpers ───────────────────────────────────────────────────────
-static void prepareAck(bool ok, uint8_t b2 = 0x00, uint8_t b3 = 0x00) {
-  spiTxBuf[0] = ACK_MAGIC;
-  spiTxBuf[1] = ok ? ACK_STATUS_OK : ACK_STATUS_ERR;
-  spiTxBuf[2] = b2;
-  spiTxBuf[3] = b3;
+static void prepareAck(uint8_t *txBuf, bool ok, uint8_t b2 = 0x00, uint8_t b3 = 0x00) {
+  txBuf[0] = ACK_MAGIC;
+  txBuf[1] = ok ? ACK_STATUS_OK : ACK_STATUS_ERR;
+  txBuf[2] = b2;
+  txBuf[3] = b3;
+}
+
+static uint32_t blockResponseLenFromPairs(uint32_t pairs) {
+  return (uint32_t)ACK_FRAME_LEN + pairs * 4u + BLOCK_TRAILER_LEN;
+}
+
+static uint32_t prepareBlockResponse(uint8_t *txBuf) {
+  return blockResponseLenFromPairs(captureBlock(txBuf));
+}
+
+static void resetStreamingPipeline() {
+  streamRespArmed = false;
+  nextBlockReady = false;
+  nextBlockLen = 0;
+}
+
+static void prefetchNextBlockIfNeeded() {
+  if (!isRunning || !streamRespArmed || nextBlockReady || gState != RESP_ARMED || xferDone) {
+    return;
+  }
+
+  nextBlockLen = prepareBlockResponse(fillRespBuf);
+  nextBlockReady = true;
 }
 
 // ── Warmup sweeps ─────────────────────────────────────────────────────
@@ -513,10 +544,10 @@ static uint32_t processCommand(const uint8_t *frame) {
   switch (cmd) {
 
     case CMD_SET_CHANNELS: {
-      if (nargs < 1) { prepareAck(false); return ACK_FRAME_LEN; }
+      if (nargs < 1) { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       uint8_t cnt = args[0];
       if (cnt == 0 || cnt > MAX_SEQ_LEN || nargs < (uint8_t)(cnt + 1))
-        { prepareAck(false); return ACK_FRAME_LEN; }
+        { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       channelCount = cnt;
       bool ok = true;
       for (uint8_t i = 0; i < cnt; i++) {
@@ -524,95 +555,105 @@ static uint32_t processCommand(const uint8_t *frame) {
         channelSeq[i] = args[i + 1];
       }
       if (ok) { buildEntryList(); clampSweepsPerBlock(); }
-      prepareAck(ok);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, ok);
       return ACK_FRAME_LEN;
     }
 
     case CMD_SET_REPEAT: {
-      if (nargs < 1) { prepareAck(false); return ACK_FRAME_LEN; }
+      if (nargs < 1) { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       repeatCount = max((uint16_t)1, min((uint16_t)args[0], MAX_REPEAT));
       buildEntryList();
       clampSweepsPerBlock();
-      prepareAck(true);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, true);
       return ACK_FRAME_LEN;
     }
 
     case CMD_SET_BUFFER: {
-      if (nargs < 1) { prepareAck(false); return ACK_FRAME_LEN; }
+      if (nargs < 1) { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       sweepsPerBlock = max((uint16_t)1, (uint16_t)args[0]);
       clampSweepsPerBlock();
-      prepareAck(true);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, true);
       return ACK_FRAME_LEN;
     }
 
     case CMD_SET_REF: {
-      if (nargs < 1) { prepareAck(false); return ACK_FRAME_LEN; }
+      if (nargs < 1) { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       if (args[0] == 0) { g_vref_mV = 1200; g_vref_sel = iadcCfgReferenceInt1V2; }
       else               { g_vref_mV = 3300; g_vref_sel = iadcCfgReferenceVddx;   }
       g_configDirty = true;
-      prepareAck(true);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, true);
       return ACK_FRAME_LEN;
     }
 
     case CMD_SET_OSR: {
-      if (nargs < 1) { prepareAck(false); return ACK_FRAME_LEN; }
+      if (nargs < 1) { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       if      (args[0] == 2) g_osr = iadcCfgOsrHighSpeed2x;
       else if (args[0] == 4) g_osr = iadcCfgOsrHighSpeed4x;
       else if (args[0] == 8) g_osr = iadcCfgOsrHighSpeed8x;
-      else { prepareAck(false); return ACK_FRAME_LEN; }
+      else { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       g_configDirty = true;
-      prepareAck(true);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, true);
       return ACK_FRAME_LEN;
     }
 
     case CMD_SET_GAIN: {
-      if (nargs < 1) { prepareAck(false); return ACK_FRAME_LEN; }
+      if (nargs < 1) { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       if      (args[0] == 1) g_gain = iadcCfgAnalogGain1x;
       else if (args[0] == 2) g_gain = iadcCfgAnalogGain2x;
       else if (args[0] == 3) g_gain = iadcCfgAnalogGain3x;
       else if (args[0] == 4) g_gain = iadcCfgAnalogGain4x;
-      else { prepareAck(false); return ACK_FRAME_LEN; }
+      else { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       g_configDirty = true;
-      prepareAck(true);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, true);
       return ACK_FRAME_LEN;
     }
 
     case CMD_GROUND_PIN: {
       if (nargs < 1 || args[0] > MUX_CH_MAX)
-        { prepareAck(false); return ACK_FRAME_LEN; }
+        { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       groundMuxCh = args[0];
       useGround   = true;
       buildEntryList();
-      prepareAck(true);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, true);
       return ACK_FRAME_LEN;
     }
 
     case CMD_GROUND_EN: {
-      if (nargs < 1) { prepareAck(false); return ACK_FRAME_LEN; }
+      if (nargs < 1) { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
       useGround = (args[0] != 0);
       buildEntryList();
-      prepareAck(true);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, true);
       return ACK_FRAME_LEN;
     }
 
     case CMD_MCU_ID:
       // Encode 'M','G' in bytes 2-3 of ACK so Teensy can identify MG24
-      prepareAck(true, 'M', 'G');
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, true, 'M', 'G');
       return ACK_FRAME_LEN;
 
     case CMD_STOP:
       isRunning = timedRun = false;
-      prepareAck(true);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, true);
       return ACK_FRAME_LEN;
 
     case CMD_RUN: {
-      if (channelCount == 0) { prepareAck(false); return ACK_FRAME_LEN; }
+      if (channelCount == 0) { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
 
       if (g_configDirty) {
         initIADC();
         buildEntryList();
       }
-      if (!g_iadcReady) { prepareAck(false); return ACK_FRAME_LEN; }
+      if (!g_iadcReady) { prepareAck(armedRespBuf, false); return ACK_FRAME_LEN; }
 
       // Parse optional timed duration (4 bytes LE = ms)
       if (nargs == 4) {
@@ -626,31 +667,34 @@ static uint32_t processCommand(const uint8_t *frame) {
         timedRun = false;
       }
       isRunning = true;
+      resetStreamingPipeline();
 
       doWarmup();
 
-      uint32_t pairs = captureBlock();
-      return (uint32_t)ACK_FRAME_LEN + pairs * 4u + BLOCK_TRAILER_LEN;
+      return prepareBlockResponse(armedRespBuf);
     }
 
     case CMD_CONTINUE: {
       // Capture the next streaming block without warmup.
       // Returns error ACK (status=0x01) if not running — Teensy treats that as stop signal.
       if (!isRunning || !g_iadcReady || channelCount == 0) {
-        prepareAck(false);
+        resetStreamingPipeline();
+        prepareAck(armedRespBuf, false);
         return ACK_FRAME_LEN;
       }
       if (timedRun && (int32_t)(millis() - runStopMillis) >= 0) {
         isRunning = timedRun = false;
-        prepareAck(false);   // error ACK signals Teensy to stop
+        resetStreamingPipeline();
+        prepareAck(armedRespBuf, false);   // error ACK signals Teensy to stop
         return ACK_FRAME_LEN;
       }
-      uint32_t pairs = captureBlock();
-      return (uint32_t)ACK_FRAME_LEN + pairs * 4u + BLOCK_TRAILER_LEN;
+      resetStreamingPipeline();
+      return prepareBlockResponse(armedRespBuf);
     }
 
     default:
-      prepareAck(false);
+      resetStreamingPipeline();
+      prepareAck(armedRespBuf, false);
       return ACK_FRAME_LEN;
   }
 }
@@ -705,6 +749,10 @@ void setup() {
 // ── loop() ────────────────────────────────────────────────────────────
 void loop() {
 
+  // While the current streaming block is being sent via SPI DMA, use CPU time
+  // to capture the next block into the alternate buffer.
+  prefetchNextBlockIfNeeded();
+
   // Only act on CS rising edge — identical to test3
   if (!csRose) return;
   csRose = false;
@@ -731,14 +779,37 @@ void loop() {
       // Received a CMD_FRAME_LEN-byte command frame from Teensy.
       // processCommand() fills spiTxBuf and returns the response size.
       uint32_t rLen = processCommand(cmdRxBuf);
-      armResp(rLen);
+      armResp(armedRespBuf, rLen, (rLen > ACK_FRAME_LEN) && isRunning);
       break;
     }
 
     case RESP_ARMED: {
-      // Teensy has finished reading the response (ACK or data block).
-      // Always return to WAIT_CMD so the Teensy can send CMD_CONTINUE or CMD_STOP.
-      // Per-block handshake: MG24 never pre-captures the next block on its own.
+      // After each streaming transfer, the first byte clocked in from the
+      // Teensy decides whether to stop or continue the continuous stream.
+      if (streamRespArmed && isRunning) {
+        uint8_t controlByte = spiRxSink[0];
+
+        if (controlByte == CMD_STOP) {
+          isRunning = timedRun = false;
+          nextBlockReady = false;
+          prepareAck(armedRespBuf, true);
+          armResp(armedRespBuf, ACK_FRAME_LEN, false);
+          break;
+        }
+
+        uint8_t *completedBuf = armedRespBuf;
+        if (!nextBlockReady) {
+          nextBlockLen = prepareBlockResponse(fillRespBuf);
+          nextBlockReady = true;
+        }
+
+        armResp(fillRespBuf, nextBlockLen, true);
+        fillRespBuf = completedBuf;
+        nextBlockReady = false;
+        break;
+      }
+
+      streamRespArmed = false;
       armCmd();
       break;
     }

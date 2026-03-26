@@ -44,7 +44,7 @@
 static const uint8_t CS_PIN              = 10;
 
 // ── SPI transport ─────────────────────────────────────────────────────
-static const uint32_t SPI_BITRATE        = 1000000UL; // 1 MHz (same as test3)
+static const uint32_t SPI_BITRATE        = 4000000UL; // 4 MHz
 
 // ── CS setup time ─────────────────────────────────────────────────────
 // Short pause between asserting CS and the first SCK edge (same as test3).
@@ -69,7 +69,7 @@ static const uint8_t  ACK_STATUS_OK      = 0x00;
 // Time (ms) to wait after sending any non-RUN command before reading the
 // 4-byte ACK.  Covers MG24 command processing time.
 static const uint32_t CONFIG_ACK_DELAY_MS   = 20;
-static const uint32_t INTER_BLOCK_CMD_DELAY_MS = 3;
+static const uint32_t INTER_BLOCK_CMD_DELAY_MS = 0;
 
 // ── Timing: MUX settling (must match MG24 MUX_SETTLE_US) ─────────────
 // Used in blockDelayMs() to estimate per-pair capture time.
@@ -85,7 +85,7 @@ static const uint32_t IADC_CONV_US_OSR8     = 8;
 
 // ── Timing: safety margins ────────────────────────────────────────────
 // Extra ms added to block delay to cover jitter, interrupt latency, etc.
-static const uint32_t BLOCK_DELAY_MARGIN_MS = 15;
+static const uint32_t BLOCK_DELAY_MARGIN_MS = 5; // was 15
 // Extra ms added to warmup delay.
 static const uint32_t WARMUP_DELAY_MARGIN_MS = 10;
 
@@ -121,6 +121,7 @@ static const uint8_t CMD_MCU_ID        = 0x0A;
 static const uint8_t CMD_GROUND_PIN    = 0x0B;
 static const uint8_t CMD_GROUND_EN     = 0x0C;
 static const uint8_t CMD_CONTINUE      = 0x0D;  // request next streaming block
+static const uint8_t STREAM_NOP        = 0x00;
 
 // ── SPI bus (default SPI0, same as test3) ────────────────────────────
 static SPIClass &mg24SPI = SPI;
@@ -141,40 +142,77 @@ struct Config {
 } cfg;
 
 // ── SPI helpers ───────────────────────────────────────────────────────
-static void spiSendBytes(const uint8_t *buf, uint16_t len) {
+static void spiTransferBytes(const uint8_t *txBuf, uint8_t *rxBuf, uint16_t len) {
   mg24SPI.beginTransaction(SPI_CFG);
   digitalWrite(CS_PIN, LOW);
   delayMicroseconds(CS_SETUP_US);
-  for (uint16_t i = 0; i < len; i++) mg24SPI.transfer(buf[i]);
+  for (uint16_t i = 0; i < len; i++) {
+    uint8_t tx = txBuf ? txBuf[i] : 0x00;
+    uint8_t rx = mg24SPI.transfer(tx);
+    if (rxBuf) rxBuf[i] = rx;
+  }
   digitalWrite(CS_PIN, HIGH);
   mg24SPI.endTransaction();
+}
+
+static void spiSendBytes(const uint8_t *buf, uint16_t len) {
+  spiTransferBytes(buf, nullptr, len);
 }
 
 static void spiRecvBytes(uint8_t *buf, uint16_t len) {
-  mg24SPI.beginTransaction(SPI_CFG);
-  digitalWrite(CS_PIN, LOW);
-  delayMicroseconds(CS_SETUP_US);
-  for (uint16_t i = 0; i < len; i++) buf[i] = mg24SPI.transfer(0x00);
-  digitalWrite(CS_PIN, HIGH);
-  mg24SPI.endTransaction();
+  spiTransferBytes(nullptr, buf, len);
 }
 
-// Read a streaming response and tolerate brief not-ready windows between
-// CMD_CONTINUE and the MG24 arming its next response buffer.
-static bool spiRecvStreamingResponse(uint8_t *buf, uint16_t len, uint8_t maxAttempts = 4) {
+// Read a streaming response where the first transmitted byte can carry a
+// control token for the MG24 streaming state machine.
+static bool spiRecvStreamingResponse(uint8_t *buf,
+                                     uint16_t len,
+                                     uint8_t controlByte = STREAM_NOP,
+                                     uint8_t maxAttempts = 4) {
   for (uint8_t attempt = 0; attempt < maxAttempts; ++attempt) {
-    spiRecvBytes(buf, len);
+    mg24SPI.beginTransaction(SPI_CFG);
+    digitalWrite(CS_PIN, LOW);
+    delayMicroseconds(CS_SETUP_US);
+    if (len > 0) {
+      buf[0] = mg24SPI.transfer(controlByte);
+      for (uint16_t i = 1; i < len; i++) buf[i] = mg24SPI.transfer(0x00);
+    }
+    digitalWrite(CS_PIN, HIGH);
+    mg24SPI.endTransaction();
+
     if (buf[0] == ACK_MAGIC) return true;
     if (buf[0] == BLOCK_MAGIC1 && buf[1] == BLOCK_MAGIC2) return true;
-    delay(2 + attempt * 2);
+    delayMicroseconds(250 + attempt * 250);
   }
   return false;
 }
 
+static bool spiRecvAckResponse(uint8_t *buf, uint8_t maxAttempts = 4) {
+  for (uint8_t attempt = 0; attempt < maxAttempts; ++attempt) {
+    spiRecvBytes(buf, ACK_FRAME_LEN);
+    if (buf[0] == ACK_MAGIC) return true;
+    delayMicroseconds(200 + attempt * 200);
+  }
+  return false;
+}
+
+static void writeBlockToHostBuffered(const uint8_t *buf, uint32_t len) {
+  uint32_t offset = 0;
+  while (offset < len) {
+    int writable = Serial.availableForWrite();
+    if (writable <= 0) {
+      yield();
+      continue;
+    }
+
+    uint32_t chunk = min((uint32_t)writable, len - offset);
+    offset += (uint32_t)Serial.write(buf + offset, chunk);
+  }
+}
+
 static void emitBlockToHost(const uint8_t *buf, uint32_t len) {
   if (!DEBUG_TEXT_STREAM) {
-    Serial.write(buf, (size_t)len);
-    Serial.flush();
+    writeBlockToHostBuffered(buf, len);
     return;
   }
 
@@ -433,14 +471,12 @@ static bool handleGround(const String &args) {
 
 // ── RUN — special: blocking, handles its own ack before streaming ──────
 //
-// Stop protocol (avoids SPIDRV size mismatch):
-//   The MG24 is always armed with armResp(rBytes) after each block.
-//   Instead of sending a separate 20-byte CMD_STOP frame (which would
-//   mismatch the armed rBytes, causing the DMA to never complete and a
-//   200 ms callback timeout), we embed CMD_STOP in the FIRST BYTE of
-//   the next normal block-read transaction.  The MG24 checks
-//   spiRxSink[0] after each response; if it equals CMD_STOP it arms a
-//   4-byte ACK instead of the next data block.  Sizes always match.
+// Continuous stream protocol:
+//   After CMD_RUN, MG24 pre-captures blocks into alternating buffers.
+//   Each block read is a single full-duplex SPI transaction. The first byte
+//   sent by the Teensy is a control token: 0x00 = continue, CMD_STOP = stop.
+//   MG24 inspects that control byte after each block transfer and either arms
+//   the next block immediately or a final 4-byte ACK.
 static void handleRun(const String &args) {
   if (cfg.channelCount == 0) {
     Serial.println(F("# ERROR: no channels configured"));
@@ -497,14 +533,9 @@ static void handleRun(const String &args) {
   // ── Streaming loop — per-block handshake ─────────────────────────────
   // Each iteration:
   //   1. Check for stop* from Python or duration expiry
-  //   2. If stopping: send CMD_STOP (20 bytes), read 4-byte ACK, done.
-  //   3. Otherwise:  send CMD_CONTINUE (20 bytes), wait blockDelayMs(),
-  //                  read rBytes block, validate magic, forward to Python.
-  //
-  // MG24 is always in WAIT_CMD between blocks (RESP_ARMED → armCmd()).
-  // Every Teensy→MG24 transaction is exactly CMD_FRAME_LEN bytes.
-  // Every MG24→Teensy response is either ACK_FRAME_LEN (4) or rBytes.
-  // No size mismatches, no in-band signalling, no shifted reads.
+  //   2. If stopping: clock out one final block read with CMD_STOP in byte 0,
+  //      then read the final 4-byte ACK.
+  //   3. Otherwise: read the next full block and forward it to Python.
   while (true) {
 
     // Check serial for stop* from Python host
@@ -515,23 +546,28 @@ static void handleRun(const String &args) {
     if (cfg.running && timed && (millis() - runStart) >= ms) cfg.running = false;
 
     if (!cfg.running) {
-      // Send CMD_STOP and read the 4-byte ACK
-      sendCmd(CMD_STOP);
-      delay(CONFIG_ACK_DELAY_MS);
+      // MG24 is already armed with the next block; send CMD_STOP as the first
+      // byte of the block-read transaction so it will arm a final ACK after.
+      spiRecvStreamingResponse(rxBuf,
+                               (uint16_t)min(rBytes, (uint32_t)sizeof(rxBuf)),
+                               CMD_STOP,
+                               2);
       uint8_t ack[ACK_FRAME_LEN];
-      spiRecvBytes(ack, ACK_FRAME_LEN); // discard
+      spiRecvAckResponse(ack, 4); // discard final ACK
       delay(INTER_BLOCK_CMD_DELAY_MS);
       break;
     }
 
-    // Request next block
-    sendCmd(CMD_CONTINUE);
-    delay(blockDelayMs());
-    if (!spiRecvStreamingResponse(rxBuf, (uint16_t)min(rBytes, (uint32_t)sizeof(rxBuf)))) {
-      sendCmd(CMD_STOP);
-      delay(CONFIG_ACK_DELAY_MS);
+    if (!spiRecvStreamingResponse(rxBuf,
+                                  (uint16_t)min(rBytes, (uint32_t)sizeof(rxBuf)),
+                                  STREAM_NOP,
+                                  2)) {
+      spiRecvStreamingResponse(rxBuf,
+                               (uint16_t)min(rBytes, (uint32_t)sizeof(rxBuf)),
+                               CMD_STOP,
+                               2);
       uint8_t ack[ACK_FRAME_LEN];
-      spiRecvBytes(ack, ACK_FRAME_LEN);
+      spiRecvAckResponse(ack, 4);
       delay(INTER_BLOCK_CMD_DELAY_MS);
       cfg.running = false;
       break;
@@ -545,10 +581,12 @@ static void handleRun(const String &args) {
 
     if (rxBuf[0] != BLOCK_MAGIC1 || rxBuf[1] != BLOCK_MAGIC2) {
       // Unexpected bytes — stop cleanly
-      sendCmd(CMD_STOP);
-      delay(CONFIG_ACK_DELAY_MS);
+      spiRecvStreamingResponse(rxBuf,
+                               (uint16_t)min(rBytes, (uint32_t)sizeof(rxBuf)),
+                               CMD_STOP,
+                               2);
       uint8_t ack[ACK_FRAME_LEN];
-      spiRecvBytes(ack, ACK_FRAME_LEN);
+      spiRecvAckResponse(ack, 4);
       delay(INTER_BLOCK_CMD_DELAY_MS);
       cfg.running = false; break;
     }
