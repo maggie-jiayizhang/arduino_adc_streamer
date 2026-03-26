@@ -62,6 +62,9 @@ class MCUDetectorMixin:
         if hasattr(self, 'update_heatmap_ui_for_mode'):
             self.update_heatmap_ui_for_mode()
 
+        if hasattr(self, 'update_array_acquisition_inputs_visibility'):
+            self.update_array_acquisition_inputs_visibility()
+
         # 555 analyzer mode: hide ADC-specific controls, show 555 parameter controls
         if is_555:
             if hasattr(self, 'ground_pin_label'):
@@ -206,3 +209,6 @@ class MCUDetectorMixin:
 
         if hasattr(self, 'update_heatmap_ui_for_mode'):
             self.update_heatmap_ui_for_mode()
+
+        if hasattr(self, 'update_array_acquisition_inputs_visibility'):
+            self.update_array_acquisition_inputs_visibility()

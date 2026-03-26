@@ -18,9 +18,131 @@ from config.buffer_utils import validate_and_limit_sweeps_per_block
 class ConfigurationMixin:
     """Mixin class for configuration management and event handlers."""
 
+    def is_array_mcu_mode(self) -> bool:
+        """Return True for any Array* MCU identifier."""
+        return (self.current_mcu or "").strip().lower().startswith("array")
+
     def is_array_pzt1_mode(self) -> bool:
         """Return True when the connected MCU streams paired MUX data."""
         return (self.current_mcu or "").strip().lower() == "array_pzt1".lower()
+
+    def update_array_acquisition_inputs_visibility(self):
+        """Show PZT/PZR selectors only for Array* MCU modes."""
+        enabled = self.is_array_mcu_mode()
+        for attr_name in (
+            'pzt_sequence_label',
+            'pzt_sequence_input',
+            'pzr_sequence_label',
+            'pzr_sequence_input',
+        ):
+            widget = getattr(self, attr_name, None)
+            if widget is not None:
+                widget.setVisible(enabled)
+
+        if not enabled:
+            if hasattr(self, 'pzt_sequence_input'):
+                self.pzt_sequence_input.blockSignals(True)
+                self.pzt_sequence_input.clear()
+                self.pzt_sequence_input.blockSignals(False)
+            if hasattr(self, 'pzr_sequence_input'):
+                self.pzr_sequence_input.blockSignals(True)
+                self.pzr_sequence_input.clear()
+                self.pzr_sequence_input.blockSignals(False)
+
+    def _parse_sensor_numbers(self, text: str, prefix: str) -> list[str]:
+        """Parse '1,3,5' into ['PZT1','PZT3','PZT5'] or ['PZR...'].
+
+        Raises ValueError on invalid format.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return []
+
+        sensors: list[str] = []
+        seen = set()
+        for token in raw.split(','):
+            stripped = token.strip()
+            if not stripped:
+                continue
+            try:
+                number = int(stripped)
+            except ValueError as exc:
+                raise ValueError(f"Invalid {prefix} sensor list value '{stripped}'") from exc
+            if number <= 0:
+                raise ValueError(f"{prefix} sensor numbers must be > 0")
+
+            sensor_id = f"{prefix}{number}"
+            if sensor_id not in seen:
+                seen.add(sensor_id)
+                sensors.append(sensor_id)
+        return sensors
+
+    def get_effective_channels_selection(self, require_non_empty: bool = False):
+        """Resolve effective channels with manual Channels Sequence override.
+
+        Priority:
+        1) If Channels Sequence is non-empty, use it and ignore PZT/PZR inputs.
+        2) Else if Array* MCU, map PZT/PZR sensor IDs via active sensor mux_mapping.
+        """
+        channels_text = self.channels_input.text().strip() if hasattr(self, 'channels_input') else ""
+        if channels_text:
+            try:
+                channels = [int(c.strip()) for c in channels_text.split(',') if c.strip()]
+            except ValueError as exc:
+                raise ValueError("Invalid channel format in Channels Sequence") from exc
+
+            if any(channel < 0 or channel > 9 for channel in channels):
+                raise ValueError("Channels Sequence values must be in range 0-9")
+            if not channels and require_non_empty:
+                raise ValueError("Please specify channels first")
+            return channels, ",".join(str(c) for c in channels), "manual", []
+
+        if not self.is_array_mcu_mode():
+            if require_non_empty:
+                raise ValueError("Please specify channels first")
+            return [], "", "none", []
+
+        pzt_text = self.pzt_sequence_input.text().strip() if hasattr(self, 'pzt_sequence_input') else ""
+        pzr_text = self.pzr_sequence_input.text().strip() if hasattr(self, 'pzr_sequence_input') else ""
+
+        pzt_sensors = self._parse_sensor_numbers(pzt_text, "PZT")
+        pzr_sensors = self._parse_sensor_numbers(pzr_text, "PZR")
+        requested_sensors = pzt_sensors + pzr_sensors
+
+        if not requested_sensors:
+            if require_non_empty:
+                raise ValueError("Specify Channels Sequence or PZT/PZR sensor selections")
+            return [], "", "none", []
+
+        active_config = self.get_active_sensor_configuration() if hasattr(self, 'get_active_sensor_configuration') else {}
+        mux_mapping = active_config.get('mux_mapping', {}) if isinstance(active_config, dict) else {}
+        if not isinstance(mux_mapping, dict) or not mux_mapping:
+            raise ValueError("No array sensor association configured in Sensor Layout")
+
+        missing = [sensor_id for sensor_id in requested_sensors if sensor_id not in mux_mapping]
+        if missing:
+            raise ValueError("No channel association configured for: " + ", ".join(missing))
+
+        channels: list[int] = []
+        for sensor_id in requested_sensors:
+            mapping = mux_mapping.get(sensor_id, {})
+            sensor_channels = mapping.get('channels', []) if isinstance(mapping, dict) else []
+            if not isinstance(sensor_channels, list) or not sensor_channels:
+                raise ValueError(f"No channels configured for {sensor_id}")
+            for value in sensor_channels:
+                try:
+                    channel = int(value)
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(f"Invalid channel configured for {sensor_id}") from exc
+                if channel < 0 or channel > 9:
+                    raise ValueError(f"Out-of-range channel configured for {sensor_id}: {channel}")
+                if channel not in channels:
+                    channels.append(channel)
+
+        if not channels:
+            raise ValueError("Selected sensors did not resolve to any channels")
+
+        return channels, ",".join(str(c) for c in channels), "array", requested_sensors
 
     def get_effective_channel_multiplier(self) -> int:
         """Return how many physical samples each requested channel produces."""
@@ -49,6 +171,51 @@ class ConfigurationMixin:
 
         specs = []
         if self.is_array_pzt1_mode():
+            selection_source = str(self.config.get('channel_selection_source', 'manual')).lower()
+            selected_array_sensors = self.config.get('selected_array_sensors', [])
+
+            if selection_source == 'array' and selected_array_sensors:
+                active_config = self.get_active_sensor_configuration() if hasattr(self, 'get_active_sensor_configuration') else {}
+                mux_mapping = active_config.get('mux_mapping', {}) if isinstance(active_config, dict) else {}
+                channel_sensor_map = self.get_active_channel_sensor_map() if hasattr(self, 'get_active_channel_sensor_map') else ["T", "R", "C", "L", "B"]
+
+                color_slot = 0
+                for sensor_id in selected_array_sensors:
+                    sensor_mapping = mux_mapping.get(sensor_id, {}) if isinstance(mux_mapping, dict) else {}
+                    if not isinstance(sensor_mapping, dict):
+                        continue
+
+                    mux_num = int(sensor_mapping.get('mux', 1))
+                    mux_index = max(0, min(1, mux_num - 1))
+                    sensor_channels = []
+                    for value in sensor_mapping.get('channels', []):
+                        try:
+                            sensor_channels.append(int(value))
+                        except (ValueError, TypeError):
+                            continue
+                    sensor_channels = sorted(sensor_channels)
+
+                    for local_idx, channel in enumerate(sensor_channels):
+                        sample_indices = []
+                        for seq_idx, seq_channel in enumerate(channels):
+                            if seq_channel != channel:
+                                continue
+                            base_idx = seq_idx * repeat_count * 2
+                            for repeat_idx in range(repeat_count):
+                                sample_indices.append(base_idx + (repeat_idx * 2) + mux_index)
+
+                        placement = str(channel_sensor_map[local_idx]) if local_idx < len(channel_sensor_map) else f"C{local_idx + 1}"
+                        specs.append({
+                            'key': ('sensor', sensor_id, placement, channel, mux_num),
+                            'label': f"{sensor_id}_{placement}",
+                            'sample_indices': sample_indices,
+                            'color_slot': color_slot,
+                        })
+                        color_slot += 1
+
+                if specs:
+                    return specs
+
             for mux_index in range(2):
                 mux_number = mux_index + 1
                 for display_order, channel in enumerate(unique_channels):
@@ -116,21 +283,55 @@ class ConfigurationMixin:
 
     def on_channels_changed(self, text: str):
         """Handle channels sequence change."""
-        # Always update config when text changes
+        # Manual channels override PZT/PZR selectors when non-empty
         if text.strip():
             try:
                 # Parse channels for visualization
-                channels = [int(c.strip()) for c in text.split(',')]
+                channels = [int(c.strip()) for c in text.split(',') if c.strip()]
                 self.config['channels'] = channels
+                self.config['channel_selection_source'] = 'manual'
+                self.config['selected_array_sensors'] = []
                 self.update_channel_list()
                 self.config_is_valid = False
                 self.update_start_button_state()
             except ValueError:
                 # Invalid channel format - will be caught when configuring
                 pass
+        elif self.is_array_mcu_mode():
+            # Recompute from PZT/PZR selectors when manual channels are cleared
+            self.on_array_sensor_selection_changed("")
         
         # Don't send command immediately - will be sent on Start
         # This prevents sending incomplete commands while user is typing
+
+    def on_array_sensor_selection_changed(self, _text: str):
+        """Handle PZT/PZR array sensor selectors in acquisition section."""
+        if not self.is_array_mcu_mode():
+            return
+
+        # Explicit Channels Sequence has higher priority; ignore selectors.
+        if hasattr(self, 'channels_input') and self.channels_input.text().strip():
+            return
+
+        try:
+            channels, _, source, selected_sensors = self.get_effective_channels_selection(require_non_empty=False)
+            if source == 'array':
+                self.config['channels'] = channels
+                self.config['channel_selection_source'] = 'array'
+                self.config['selected_array_sensors'] = list(selected_sensors)
+                self.update_channel_list()
+                self.config_is_valid = False
+                self.update_start_button_state()
+            elif source == 'none':
+                self.config['channels'] = []
+                self.config['channel_selection_source'] = 'none'
+                self.config['selected_array_sensors'] = []
+                self.update_channel_list()
+                self.config_is_valid = False
+                self.update_start_button_state()
+        except ValueError:
+            # Keep UI responsive while user is typing; hard validation occurs on Configure.
+            pass
 
     def on_ground_pin_changed(self, value: int):
         """Handle ground pin change."""
@@ -285,16 +486,18 @@ class ConfigurationMixin:
             return
         
         # Validate input
-        channels_text = self.channels_input.text().strip()
-        if not channels_text:
-            self.log_status("ERROR: Please specify channels first")
-            return
-        
         try:
-            desired_channels = [int(c.strip()) for c in channels_text.split(',')]
-        except ValueError:
-            self.log_status("ERROR: Invalid channel format")
+            desired_channels, effective_channels_text, source, selected_sensors = self.get_effective_channels_selection(require_non_empty=True)
+        except ValueError as exc:
+            self.log_status(f"ERROR: {exc}")
             return
+
+        self.config['channels'] = desired_channels
+        self.config['channel_selection_source'] = source
+        self.config['selected_array_sensors'] = list(selected_sensors)
+        self.update_channel_list()
+        if source == 'array' and not self.channels_input.text().strip():
+            self.log_status(f"Using Array sensor selection -> channels: {effective_channels_text}")
         
         self.log_status("Configuring Arduino...")
         self.configure_btn.setEnabled(False)
@@ -452,7 +655,7 @@ class ConfigurationMixin:
             time.sleep(INTER_COMMAND_DELAY)
         
         # Send channels
-        channels_text = self.channels_input.text().strip()
+        channels_text = ",".join(str(channel) for channel in self.config.get('channels', []))
         if channels_text:
             success, received = self.send_command_and_wait_ack(f"channels {channels_text}", channels_text)
             if success and received:
@@ -521,7 +724,7 @@ class ConfigurationMixin:
         """Send only 555-analyzer supported configuration commands."""
         all_success = True
 
-        channels_text = self.channels_input.text().strip()
+        channels_text = ",".join(str(channel) for channel in self.config.get('channels', []))
         if channels_text:
             desired_channels = [int(c.strip()) for c in channels_text.split(',') if c.strip()]
             success, received = self.send_command_and_wait_ack(f"channels {channels_text}", None)

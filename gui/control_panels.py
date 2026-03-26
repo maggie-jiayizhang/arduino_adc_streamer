@@ -215,37 +215,58 @@ class ControlPanelsMixin:
         self.channels_input.textChanged.connect(self.on_channels_changed)
         layout.addWidget(self.channels_input, 0, 1, 1, 2)
 
+        # Array sensor selectors (used for MCU names matching Array*)
+        self.pzt_sequence_label = QLabel("PZT Sensors:")
+        layout.addWidget(self.pzt_sequence_label, 1, 0)
+        self.pzt_sequence_input = QLineEdit()
+        self.pzt_sequence_input.setPlaceholderText("e.g., 1,3,5,7")
+        self.pzt_sequence_input.textChanged.connect(self.on_array_sensor_selection_changed)
+        layout.addWidget(self.pzt_sequence_input, 1, 1, 1, 2)
+
+        self.pzr_sequence_label = QLabel("PZR Sensors:")
+        layout.addWidget(self.pzr_sequence_label, 2, 0)
+        self.pzr_sequence_input = QLineEdit()
+        self.pzr_sequence_input.setPlaceholderText("e.g., 2,4")
+        self.pzr_sequence_input.textChanged.connect(self.on_array_sensor_selection_changed)
+        layout.addWidget(self.pzr_sequence_input, 2, 1, 1, 2)
+
+        # Hidden by default; shown only for Array* MCU in ConfigurationMixin
+        self.pzt_sequence_label.hide()
+        self.pzt_sequence_input.hide()
+        self.pzr_sequence_label.hide()
+        self.pzr_sequence_input.hide()
+
         # Ground pin
         self.ground_pin_label = QLabel("Ground Pin:")
-        layout.addWidget(self.ground_pin_label, 1, 0)
+        layout.addWidget(self.ground_pin_label, 3, 0)
         self.ground_pin_spin = QSpinBox()
         self.ground_pin_spin.setRange(GROUND_PIN_MIN, GROUND_PIN_MAX)
         self.ground_pin_spin.setValue(0)  # Default to pin 0
         self.ground_pin_spin.valueChanged.connect(self.on_ground_pin_changed)
-        layout.addWidget(self.ground_pin_spin, 1, 1)
+        layout.addWidget(self.ground_pin_spin, 3, 1)
 
         # Use ground sample
         self.use_ground_check = QCheckBox("Use Ground Sample")
         self.use_ground_check.setChecked(False)  # Default to disabled
         self.use_ground_check.stateChanged.connect(self.on_use_ground_changed)
-        layout.addWidget(self.use_ground_check, 1, 2)
+        layout.addWidget(self.use_ground_check, 3, 2)
 
         # Repeat count
-        layout.addWidget(QLabel("Repeat Count:"), 2, 0)
+        layout.addWidget(QLabel("Repeat Count:"), 4, 0)
         self.repeat_spin = QSpinBox()
         self.repeat_spin.setRange(REPEAT_COUNT_MIN, REPEAT_COUNT_MAX)
         self.repeat_spin.setValue(REPEAT_COUNT_DEFAULT)
         self.repeat_spin.valueChanged.connect(self.on_repeat_changed)
-        layout.addWidget(self.repeat_spin, 2, 1)
+        layout.addWidget(self.repeat_spin, 4, 1)
 
         # Buffer size (sweeps per block)
-        layout.addWidget(QLabel("Sweeps per block (buffer):"), 3, 0)
+        layout.addWidget(QLabel("Sweeps per block (buffer):"), 5, 0)
         self.buffer_spin = QSpinBox()
         self.buffer_spin.setRange(BUFFER_SIZE_MIN, BUFFER_SIZE_MAX)
         self.buffer_spin.setValue(DEFAULT_BUFFER_SIZE)
         self.buffer_spin.setToolTip("Number of sweeps sent per block from Arduino")
         self.buffer_spin.valueChanged.connect(self.on_buffer_size_changed)
-        layout.addWidget(self.buffer_spin, 3, 1)
+        layout.addWidget(self.buffer_spin, 5, 1)
 
         group.setLayout(layout)
         return group

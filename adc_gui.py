@@ -27,6 +27,7 @@ from typing import List, Optional, Dict
 
 from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QCheckBox
 from PyQt6.QtCore import QThread, QTimer, Qt
+from PyQt6.QtGui import QGuiApplication
 import serial
 
 # Import configuration constants
@@ -182,6 +183,8 @@ class ADCStreamerGUI(
 
         self.config = {
             'channels': [],
+            'channel_selection_source': 'none',
+            'selected_array_sensors': [],
             'repeat': 1,
             'ground_pin': -1,
             'use_ground': False,
@@ -319,7 +322,16 @@ class ADCStreamerGUI(
     def init_ui(self):
         """Initialize the user interface using GUIComponentsMixin methods."""
         self.setWindowTitle("ADC Streamer - Modular Architecture")
-        self.setGeometry(100, 100, WINDOW_WIDTH, WINDOW_HEIGHT)
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            target_width = min(WINDOW_WIDTH, max(1200, available.width() - 40))
+            target_height = min(WINDOW_HEIGHT, max(900, available.height() - 40))
+            self.resize(target_width, target_height)
+            self.move(available.x() + max(0, (available.width() - target_width) // 2),
+                      available.y() + max(0, (available.height() - target_height) // 2))
+        else:
+            self.setGeometry(100, 100, WINDOW_WIDTH, WINDOW_HEIGHT)
 
         # Main widget and layout
         from PyQt6.QtWidgets import QSplitter, QVBoxLayout
